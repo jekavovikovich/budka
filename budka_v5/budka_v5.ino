@@ -1789,7 +1789,7 @@ const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/jekavovikovich
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.0.8";
+const char* FIRMWARE_VERSION = "1.0.9";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -2356,7 +2356,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
   .legend { font-size:13px; margin-bottom:8px; }
   .legend span { margin-right:14px; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; }
-  canvas { width:100%; height:auto; display:block; background:#181818; border-radius:8px; }
+  canvas { width:100%; height:auto; display:block; background:#181818; border-radius:8px; cursor:crosshair; touch-action:none; }
   .info { font-size:12px; color:#777; text-align:center; margin-top:8px; }
   button { width:100%; padding:16px; font-size:19px; background:#444; color:#fff; border:none; border-radius:10px; margin-top:4px; }
   button:active { background:#333; }
@@ -2385,7 +2385,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
     <button onclick="location.href='/'">Параметры</button>
   </div>
 <script>
-function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowEpoch) {
+function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowEpoch, hoverX) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
@@ -2492,11 +2492,14 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
 
   // --- сами линии данных: самая свежая точка всегда у правого края,
   // окно = windowMinutes (см. выше) ---
+  const dataCount = seriesList.reduce(function(m, s) { return Math.max(m, s.data.length); }, 0);
+
   seriesList.forEach(function(s) {
     ctx.strokeStyle = s.color;
     ctx.lineWidth = 2;
     ctx.beginPath();
     let started = false;
+    let lastX = null, lastY = null, lastV = null;
     const n = s.data.length;
     for (let i = 0; i < n; i++) {
       const v = s.data[i];
@@ -2506,31 +2509,175 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
       const y = marginTop + plotH * (1 - (v - minV) / (maxV - minV));
       if (!started) { ctx.moveTo(x, y); started = true; }
       else { ctx.lineTo(x, y); }
+      lastX = x; lastY = y; lastV = v;
     }
     ctx.stroke();
+
+    // --- подпись значения ПОСЛЕДНЕЙ (самой правой, самой свежей) точки -
+    // всегда видна без наведения, чтобы на телефоне не нужно было "тыкать"
+    // в график ради текущего значения ---
+    if (lastV !== null) {
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+      ctx.fillStyle = s.color;
+      ctx.fill();
+
+      let labelY = lastY - 6;
+      if (labelY < marginTop + 10) labelY = marginTop + 10;
+      if (labelY > marginTop + plotH - 2) labelY = marginTop + plotH - 2;
+
+      ctx.font = 'bold 12px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText(lastV.toFixed(s.decimals === undefined ? 1 : s.decimals) + (s.unit || ''), w - marginRight - 2, labelY);
+      ctx.textAlign = 'left'; // возвращаем выравнивание по умолчанию для остальной отрисовки
+    }
   });
+
+  // --- курсор наведения (мышь) / касания (телефон): подпись реального
+  // значения на момент логирования в точке под курсором/пальцем ---
+  if (hoverX !== null && hoverX !== undefined && dataCount > 0) {
+    const relX = Math.min(1, Math.max(0, (hoverX - marginLeft) / plotW));
+    const distFromNewest = Math.round((1 - relX) * windowMinutes);
+    const idx = dataCount - 1 - distFromNewest;
+
+    if (idx >= 0 && idx < dataCount) {
+      const cx = marginLeft + plotW * (1 - distFromNewest / windowMinutes);
+
+      ctx.save();
+      ctx.strokeStyle = '#999';
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(cx, marginTop);
+      ctx.lineTo(cx, marginTop + plotH);
+      ctx.stroke();
+      ctx.restore();
+
+      let timeLabel;
+      if (timeSynced && nowEpoch > 0) {
+        const ts = new Date((nowEpoch - distFromNewest * 60) * 1000);
+        const hh = ('0' + ts.getHours()).slice(-2);
+        const mm = ('0' + ts.getMinutes()).slice(-2);
+        timeLabel = hh + ':' + mm;
+      } else {
+        timeLabel = distFromNewest === 0 ? 'сейчас' : ('-' + distFromNewest + ' мин');
+      }
+
+      const lines = [timeLabel];
+      seriesList.forEach(function(s) {
+        const v = s.data[idx];
+        if (v === null || v === undefined) return;
+        const y = marginTop + plotH * (1 - (v - minV) / (maxV - minV));
+        ctx.beginPath();
+        ctx.arc(cx, y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = s.color;
+        ctx.fill();
+        ctx.strokeStyle = '#111';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        lines.push((s.label ? s.label + ': ' : '') + v.toFixed(s.decimals === undefined ? 1 : s.decimals) + (s.unit || ''));
+      });
+
+      ctx.font = '12px sans-serif';
+      const lineHeight = 15;
+      let boxW = 0;
+      lines.forEach(function(t) { boxW = Math.max(boxW, ctx.measureText(t).width); });
+      boxW += 12;
+      const boxH = lines.length * lineHeight + 8;
+
+      let boxX = cx + 8;
+      if (boxX + boxW > w - marginRight) boxX = cx - boxW - 8;
+      if (boxX < marginLeft) boxX = marginLeft;
+      const boxY = marginTop + 4;
+
+      ctx.fillStyle = 'rgba(20,20,20,0.92)';
+      ctx.fillRect(boxX, boxY, boxW, boxH);
+      ctx.strokeStyle = '#555';
+      ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+      lines.forEach(function(t, i) {
+        ctx.fillStyle = i === 0 ? '#ccc' : '#fff';
+        ctx.fillText(t, boxX + 6, boxY + 14 + i * lineHeight);
+      });
+    }
+  }
+}
+
+function conv10(arr) {
+  return arr.map(function(v) { return v === -1270 ? null : v / 10; });
+}
+
+// последние полученные с сервера данные истории - хранятся отдельно от
+// самой отрисовки, чтобы при наведении/касании можно было мгновенно
+// перерисовать график (с курсором) БЕЗ повторного похода на сервер
+let lastHistory = null;
+let tempHoverX = null; // X-координата курсора/пальца в системе координат canvas (не CSS-пикселей)
+let curHoverX = null;
+
+function redrawCharts() {
+  if (!lastHistory) return;
+  const d = lastHistory;
+
+  drawChart(document.getElementById('tempChart'), [
+    { data: conv10(d.out), color: '#4da6ff', label: 'Снаружи', unit: '°C', decimals: 1 },
+    { data: conv10(d.air), color: '#fff', label: 'Внутри', unit: '°C', decimals: 1 },
+    { data: conv10(d.mat), color: '#ff5c5c', label: 'Внизу', unit: '°C', decimals: 1 }
+  ], d.maxCount, false, d.timeSynced, d.nowEpoch, tempHoverX);
+
+  drawChart(document.getElementById('curChart'), [
+    { data: d.currentMa, color: '#ffa64d', label: 'Ток', unit: ' мА', decimals: 0 }
+  ], d.maxCount, true, d.timeSynced, d.nowEpoch, curHoverX);
 }
 
 function updateGraphs() {
   fetch('/api/history').then(function(r){ return r.json(); }).then(function(d){
-    function conv10(arr) {
-      return arr.map(function(v) { return v === -1270 ? null : v / 10; });
-    }
-
-    drawChart(document.getElementById('tempChart'), [
-      { data: conv10(d.out), color: '#4da6ff' },
-      { data: conv10(d.air), color: '#fff' },
-      { data: conv10(d.mat), color: '#ff5c5c' }
-    ], d.maxCount, false, d.timeSynced, d.nowEpoch);
-    drawChart(document.getElementById('curChart'), [
-      { data: d.currentMa, color: '#ffa64d' }
-    ], d.maxCount, true, d.timeSynced, d.nowEpoch);
+    lastHistory = d;
+    redrawCharts();
 
     let hours = (d.count * d.intervalSec / 3600).toFixed(1);
     let timeStatus = d.timeSynced ? 'время: NTP' : 'время: относительное (нет NTP)';
     document.getElementById('pointsInfo').textContent = d.count + ' точек (~' + hours + ' ч), интервал ' + d.intervalSec + ' с, ' + timeStatus;
   });
 }
+
+// --- наведение мышью / касание пальцем: переводим координату события в
+// систему координат canvas (её внутреннее разрешение 600x220 может
+// отличаться от того, как она физически растянута на экране через CSS) и
+// просто перерисовываем график с этой позицией - сами данные уже есть в
+// lastHistory, повторный запрос к серверу не нужен ---
+function attachHoverHandlers(canvas, setHoverX) {
+  function canvasXFromClientX(clientX) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    return (clientX - rect.left) * scaleX;
+  }
+
+  canvas.addEventListener('mousemove', function(e) {
+    setHoverX(canvasXFromClientX(e.clientX));
+    redrawCharts();
+  });
+  canvas.addEventListener('mouseleave', function() {
+    setHoverX(null);
+    redrawCharts();
+  });
+
+  canvas.addEventListener('touchstart', function(e) {
+    e.preventDefault(); // не даём странице скроллиться, пока палец на графике
+    setHoverX(canvasXFromClientX(e.touches[0].clientX));
+    redrawCharts();
+  }, { passive: false });
+  canvas.addEventListener('touchmove', function(e) {
+    e.preventDefault();
+    setHoverX(canvasXFromClientX(e.touches[0].clientX));
+    redrawCharts();
+  }, { passive: false });
+  canvas.addEventListener('touchend', function() {
+    setHoverX(null);
+    redrawCharts();
+  });
+}
+
+attachHoverHandlers(document.getElementById('tempChart'), function(x) { tempHoverX = x; });
+attachHoverHandlers(document.getElementById('curChart'), function(x) { curHoverX = x; });
 
 setInterval(updateGraphs, 20000);
 updateGraphs();
