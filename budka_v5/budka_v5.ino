@@ -1789,7 +1789,7 @@ const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/jekavovikovich
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.0.9";
+const char* FIRMWARE_VERSION = "1.0.0";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -2356,7 +2356,8 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
   .legend { font-size:13px; margin-bottom:8px; }
   .legend span { margin-right:14px; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; }
-  canvas { width:100%; height:auto; display:block; background:#181818; border-radius:8px; cursor:crosshair; touch-action:none; }
+  canvas { width:100%; height:auto; display:block; background:#181818; border-radius:8px; }
+  #tempChart { cursor:crosshair; touch-action:none; }
   .info { font-size:12px; color:#777; text-align:center; margin-top:8px; }
   button { width:100%; padding:16px; font-size:19px; background:#444; color:#fff; border:none; border-radius:10px; margin-top:4px; }
   button:active { background:#333; }
@@ -2385,7 +2386,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
     <button onclick="location.href='/'">Параметры</button>
   </div>
 <script>
-function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowEpoch, hoverX) {
+function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowEpoch, hoverX, showLastValueLabel) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
@@ -2491,9 +2492,8 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
   }
 
   // --- сами линии данных: самая свежая точка всегда у правого края,
-  // окно = windowMinutes (см. выше) ---
-  const dataCount = seriesList.reduce(function(m, s) { return Math.max(m, s.data.length); }, 0);
-
+  // окно = windowMinutes (см. выше). dataCount уже посчитан выше (при
+  // определении minV/maxV) - используем его же, повторно не объявляем. ---
   seriesList.forEach(function(s) {
     ctx.strokeStyle = s.color;
     ctx.lineWidth = 2;
@@ -2515,8 +2515,8 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
 
     // --- подпись значения ПОСЛЕДНЕЙ (самой правой, самой свежей) точки -
     // всегда видна без наведения, чтобы на телефоне не нужно было "тыкать"
-    // в график ради текущего значения ---
-    if (lastV !== null) {
+    // в график ради текущего значения (опционально - см. showLastValueLabel) ---
+    if (lastV !== null && showLastValueLabel !== false) {
       ctx.beginPath();
       ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
       ctx.fillStyle = s.color;
@@ -2611,7 +2611,7 @@ function conv10(arr) {
 // перерисовать график (с курсором) БЕЗ повторного похода на сервер
 let lastHistory = null;
 let tempHoverX = null; // X-координата курсора/пальца в системе координат canvas (не CSS-пикселей)
-let curHoverX = null;
+// у графика тока наведение/курсор не используются - он остаётся как раньше
 
 function redrawCharts() {
   if (!lastHistory) return;
@@ -2621,11 +2621,11 @@ function redrawCharts() {
     { data: conv10(d.out), color: '#4da6ff', label: 'Снаружи', unit: '°C', decimals: 1 },
     { data: conv10(d.air), color: '#fff', label: 'Внутри', unit: '°C', decimals: 1 },
     { data: conv10(d.mat), color: '#ff5c5c', label: 'Внизу', unit: '°C', decimals: 1 }
-  ], d.maxCount, false, d.timeSynced, d.nowEpoch, tempHoverX);
+  ], d.maxCount, false, d.timeSynced, d.nowEpoch, tempHoverX, true);
 
   drawChart(document.getElementById('curChart'), [
     { data: d.currentMa, color: '#ffa64d', label: 'Ток', unit: ' мА', decimals: 0 }
-  ], d.maxCount, true, d.timeSynced, d.nowEpoch, curHoverX);
+  ], d.maxCount, true, d.timeSynced, d.nowEpoch, null, false);
 }
 
 function updateGraphs() {
@@ -2677,7 +2677,9 @@ function attachHoverHandlers(canvas, setHoverX) {
 }
 
 attachHoverHandlers(document.getElementById('tempChart'), function(x) { tempHoverX = x; });
-attachHoverHandlers(document.getElementById('curChart'), function(x) { curHoverX = x; });
+// на графике тока наведение/курсор не нужны - обработчики не вешаем, canvas
+// остаётся с CSS-курсором по умолчанию (свойство cursor:crosshair снято ниже
+// точечно не требуется - карточка тока просто не реагирует на события)
 
 setInterval(updateGraphs, 20000);
 updateGraphs();
