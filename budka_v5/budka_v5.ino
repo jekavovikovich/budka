@@ -1951,7 +1951,7 @@ const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/jekavovikovich
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.1.3";
+const char* FIRMWARE_VERSION = "1.1.4";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -2209,15 +2209,75 @@ uint32_t historyBootId = 0; // выставляется в setup()
 
 unsigned long lastHistorySampleMs = 0;
 
+// --- НЕДЕЛЬНАЯ ИСТОРИЯ (7 суток, тоже только в оперативной памяти) ---
+// Второй, более грубый кольцевой буфер: каждая точка - СРЕДНЕЕ из
+// WEEK_STEP_SAMPLES минутных точек (10 минут), 1008 точек = 7 суток.
+// Память: 4 массива x 1008 x 2 байта = ~8 КБ; ответ страницы на неделю тоже
+// ~8 КБ (в пределах 16 КБ на запрос). При перезагрузке контроллера эта
+// история, как и суточная, обнуляется - это сознательное решение.
+const uint16_t WEEK_STEP_SAMPLES = 10;   // сколько минутных точек усредняется в одну недельную
+const uint16_t WEEK_SIZE = 1008;         // 7 суток x 24 часа x 6 точек в час
+
+int16_t weekOut[WEEK_SIZE];
+int16_t weekAir[WEEK_SIZE];
+int16_t weekMat[WEEK_SIZE];
+int16_t weekCurrentMa[WEEK_SIZE];
+
+uint16_t weekWriteIndex = 0;
+uint16_t weekFilledCount = 0;
+uint32_t weekTotalSamples = 0;
+
+// накопители текущей (ещё не завершённой) недельной точки
+uint16_t weekAccSamples = 0;                 // сколько минутных точек уже накоплено
+int32_t  weekAccSumOut = 0, weekAccSumAir = 0, weekAccSumMat = 0, weekAccSumCur = 0;
+uint16_t weekAccCntOut = 0, weekAccCntAir = 0, weekAccCntMat = 0; // сколько из них с ДЕЙСТВИТЕЛЬНЫМИ данными датчика
+
+// Среднее с округлением до ближайшего целого; если действительных значений
+// не было вовсе - "нет данных" (-1270, тот же код, что и в основном буфере).
+int16_t weekAverage(int32_t sum, uint16_t cnt) {
+  if (cnt == 0) return -1270;
+  int32_t half = cnt / 2;
+  return (int16_t)((sum >= 0) ? (sum + half) / cnt : (sum - half) / cnt);
+}
+
+// Добавляет очередную минутную точку в накопитель; когда накоплено
+// WEEK_STEP_SAMPLES штук - записывает их среднее как одну недельную точку.
+void accumulateWeekSample(int16_t out, int16_t air, int16_t mat, int16_t currentMa) {
+  if (out != -1270) { weekAccSumOut += out; weekAccCntOut++; }
+  if (air != -1270) { weekAccSumAir += air; weekAccCntAir++; }
+  if (mat != -1270) { weekAccSumMat += mat; weekAccCntMat++; }
+  weekAccSumCur += currentMa;
+  weekAccSamples++;
+
+  if (weekAccSamples < WEEK_STEP_SAMPLES) return;
+
+  weekOut[weekWriteIndex]       = weekAverage(weekAccSumOut, weekAccCntOut);
+  weekAir[weekWriteIndex]       = weekAverage(weekAccSumAir, weekAccCntAir);
+  weekMat[weekWriteIndex]       = weekAverage(weekAccSumMat, weekAccCntMat);
+  weekCurrentMa[weekWriteIndex] = weekAverage(weekAccSumCur, weekAccSamples); // ток всегда "действителен"
+
+  weekWriteIndex = (weekWriteIndex + 1) % WEEK_SIZE;
+  if (weekFilledCount < WEEK_SIZE) weekFilledCount++;
+  weekTotalSamples++;
+
+  weekAccSamples = 0;
+  weekAccSumOut = weekAccSumAir = weekAccSumMat = weekAccSumCur = 0;
+  weekAccCntOut = weekAccCntAir = weekAccCntMat = 0;
+}
+
 void recordHistorySample() {
+  int16_t currentMa = (int16_t)((int32_t)currentAmpsForDisplay * 10); // сотые А -> мА
+
   historyTotalSamples++;
   historyOut[historyWriteIndex] = tempOut;
   historyAir[historyWriteIndex] = tempAir;
   historyMat[historyWriteIndex] = tempMat;
-  historyCurrentMa[historyWriteIndex] = (int16_t)((int32_t)currentAmpsForDisplay * 10); // сотые А -> мА
+  historyCurrentMa[historyWriteIndex] = currentMa;
 
   historyWriteIndex = (historyWriteIndex + 1) % HISTORY_SIZE;
   if (historyFilledCount < HISTORY_SIZE) historyFilledCount++;
+
+  accumulateWeekSample(tempOut, tempAir, tempMat, currentMa);
 }
 
 // Главная страница - вся вёрстка/стили/скрипт зашиты в один HTML (без внешних
@@ -2520,8 +2580,8 @@ static_assert(sizeof(HistoryBinHeader) == 32, "HistoryBinHeader must be exactly 
 // Отправляет один канал истории, разворачивая кольцевой буфер в
 // хронологический порядок: сначала кусок от startIndex до конца массива,
 // затем (если буфер "перешагнул" границу) продолжение с начала массива.
-void sendHistoryChannel(const int16_t* data, uint16_t count, uint16_t startIndex) {
-  uint16_t firstPart = HISTORY_SIZE - startIndex;
+void sendHistoryChannel(const int16_t* data, uint16_t count, uint16_t startIndex, uint16_t ringSize) {
+  uint16_t firstPart = ringSize - startIndex;
   if (firstPart > count) firstPart = count;
   if (firstPart > 0) {
     server.sendContent((const char*)&data[startIndex], firstPart * sizeof(int16_t));
@@ -2532,21 +2592,53 @@ void sendHistoryChannel(const int16_t* data, uint16_t count, uint16_t startIndex
   }
 }
 
-// Параметры запроса (оба необязательны):
+// Описание одного кольцевого буфера истории (суточного или недельного) -
+// обработчик ниже работает с любым из них одинаково.
+struct HistoryRingView {
+  const int16_t* out;
+  const int16_t* air;
+  const int16_t* mat;
+  const int16_t* currentMa;
+  uint16_t ringSize;
+  uint16_t writeIndex;
+  uint16_t filled;
+  uint32_t total;
+  uint32_t intervalSec;
+};
+
+// Параметры запроса (все необязательны):
+//   range - "week" для недельной истории (точки по 10 минут), иначе суточная (по 1 минуте)
 //   since - сквозной номер последней точки, которую клиент уже получил
 //   boot  - идентификатор запуска контроллера, при котором клиент получал точки
 // Если клиент передал актуальные since и boot, отдаются ТОЛЬКО новые точки
 // (флаг full = 0). Иначе (первый запрос, перезагрузка контроллера, клиент
 // слишком давно не обновлялся и часть точек уже вытеснена) - вся история
-// (флаг full = 1).
+// (флаг full = 1). Нумерация since у суточного и недельного буферов своя.
 void handleApiHistory() {
   uint32_t since = 0;
   uint32_t clientBoot = 0;
   if (server.hasArg("since")) since = strtoul(server.arg("since").c_str(), NULL, 10);
   if (server.hasArg("boot"))  clientBoot = strtoul(server.arg("boot").c_str(), NULL, 10);
 
-  uint16_t filled = historyFilledCount;
-  uint32_t total = historyTotalSamples;
+  HistoryRingView ring;
+  if (server.hasArg("range") && server.arg("range") == "week") {
+    ring.out = weekOut;  ring.air = weekAir;  ring.mat = weekMat;  ring.currentMa = weekCurrentMa;
+    ring.ringSize   = WEEK_SIZE;
+    ring.writeIndex = weekWriteIndex;
+    ring.filled     = weekFilledCount;
+    ring.total      = weekTotalSamples;
+    ring.intervalSec = (uint32_t)(WEEK_STEP_SAMPLES * (HISTORY_SAMPLE_INTERVAL_MS / 1000));
+  } else {
+    ring.out = historyOut;  ring.air = historyAir;  ring.mat = historyMat;  ring.currentMa = historyCurrentMa;
+    ring.ringSize   = HISTORY_SIZE;
+    ring.writeIndex = historyWriteIndex;
+    ring.filled     = historyFilledCount;
+    ring.total      = historyTotalSamples;
+    ring.intervalSec = (uint32_t)(HISTORY_SAMPLE_INTERVAL_MS / 1000);
+  }
+
+  uint16_t filled = ring.filled;
+  uint32_t total = ring.total;
 
   bool full = true;
   uint16_t count = filled;
@@ -2556,7 +2648,7 @@ void handleApiHistory() {
   }
 
   // индекс самой старой из отправляемых точек в кольцевом буфере
-  uint16_t startIndex = (historyWriteIndex + HISTORY_SIZE - count) % HISTORY_SIZE;
+  uint16_t startIndex = (ring.writeIndex + ring.ringSize - count) % ring.ringSize;
 
   HistoryBinHeader head;
   head.total       = total;
@@ -2564,8 +2656,8 @@ void handleApiHistory() {
   head.count       = count;
   head.flags       = (full ? 1u : 0u) | (timeSynced ? 2u : 0u);
   head.nowEpoch    = (uint32_t)time(nullptr);
-  head.intervalSec = (uint32_t)(HISTORY_SAMPLE_INTERVAL_MS / 1000);
-  head.maxCount    = HISTORY_SIZE;
+  head.intervalSec = ring.intervalSec;
+  head.maxCount    = ring.ringSize;
   head.reserved    = 0;
 
   // размер известен заранее: заголовок + 4 канала по count значений int16
@@ -2574,10 +2666,10 @@ void handleApiHistory() {
   server.send(200, "application/octet-stream", "");
 
   server.sendContent((const char*)&head, sizeof(head));
-  sendHistoryChannel(historyOut, count, startIndex);
-  sendHistoryChannel(historyAir, count, startIndex);
-  sendHistoryChannel(historyMat, count, startIndex);
-  sendHistoryChannel(historyCurrentMa, count, startIndex);
+  sendHistoryChannel(ring.out,       count, startIndex, ring.ringSize);
+  sendHistoryChannel(ring.air,       count, startIndex, ring.ringSize);
+  sendHistoryChannel(ring.mat,       count, startIndex, ring.ringSize);
+  sendHistoryChannel(ring.currentMa, count, startIndex, ring.ringSize);
 }
 
 // Страница графиков - температуры (в градусах, с точностью 0.1) и ток
@@ -2604,12 +2696,19 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
   .info { font-size:12px; color:#777; text-align:center; margin-top:8px; }
   button { width:100%; padding:16px; font-size:19px; background:#444; color:#fff; border:none; border-radius:10px; margin-top:4px; }
   button:active { background:#333; }
+  .seg { display:flex; gap:8px; margin-bottom:12px; }
+  .seg button { flex:1; padding:10px; font-size:16px; margin-top:0; background:#333; }
+  .seg button.on { background:#2a6df5; }
 </style>
 </head>
 <body>
   <div class="card">
     <div class="title">Будка</div>
-    <h2 class="subtitle">Температуры, &deg;C (24 часа)</h2>
+    <div class="seg">
+      <button id="btnDay" class="on" onclick="setRange('day')">24 часа</button>
+      <button id="btnWeek" onclick="setRange('week')">7 дней</button>
+    </div>
+    <h2 class="subtitle">Температуры, &deg;C (<span class="rangeLabel">24 часа</span>)</h2>
     <div class="legend">
       <span><span class="dot" style="background:#4da6ff"></span>Снаружи</span>
       <span><span class="dot" style="background:#fff"></span>Внутри</span>
@@ -2618,7 +2717,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
     <canvas id="tempChart" width="600" height="220"></canvas>
   </div>
   <div class="card">
-    <h2 class="subtitle">Ток нагревателя, мА (24 часа)</h2>
+    <h2 class="subtitle">Ток нагревателя, мА (<span class="rangeLabel">24 часа</span>)</h2>
     <div class="legend">
       <span><span class="dot" style="background:#ffa64d"></span>Ток</span>
     </div>
@@ -2629,7 +2728,8 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
     <button onclick="location.href='/'">Параметры</button>
   </div>
 <script>
-function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowEpoch, hoverX, showLastValueLabel) {
+function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowEpoch, hoverX, showLastValueLabel, stepMinutes) {
+  const step = stepMinutes || 1; // минут в одной точке (1 - сутки, 10 - неделя)
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
@@ -2653,14 +2753,15 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
   // всю ширину холста занятой; когда буфер заполнится полностью (maxSlots,
   // т.е. 24ч) - окно перестаёт расти, и новые точки начинают вытеснять
   // старые слева, что и даёт эффект прокрутки "как на осциллографе". ---
-  const windowMinutes = Math.max(1, Math.min(dataCount, maxSlots));
+  const windowMinutes = Math.max(step, Math.min(dataCount, maxSlots) * step);
 
   // --- шаг сетки по времени подбирается под размер окна ---
   let gridStepMin;
   if (windowMinutes <= 60) gridStepMin = 10;
   else if (windowMinutes <= 120) gridStepMin = 15;
   else if (windowMinutes <= 240) gridStepMin = 30;
-  else gridStepMin = 60;
+  else if (windowMinutes <= 2880) gridStepMin = 60;
+  else gridStepMin = 1440;
 
   const marginLeft = 42, marginRight = 8, marginTop = 8, marginBottom = 16;
   const plotW = w - marginLeft - marginRight;
@@ -2687,7 +2788,28 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
   ctx.fillStyle = '#2ecc71';
   ctx.font = '12px sans-serif';
 
-  if (timeSynced && nowEpoch > 0) {
+  if (timeSynced && nowEpoch > 0 && windowMinutes > 2880) {
+    // длинное окно (неделя): линии на полуночах, подписи - день недели и число.
+    // Перебор через setDate(-1), а не "минус 86400 с", чтобы переход на
+    // летнее/зимнее время не сдвигал линии.
+    const dayNames = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+    const windowStartEpoch = nowEpoch - windowMinutes * 60;
+    let day = new Date(nowEpoch * 1000);
+    day.setHours(0, 0, 0, 0);
+    for (let guard = 0; guard < 40; guard++) {
+      const t = Math.floor(day.getTime() / 1000);
+      if (t < windowStartEpoch) break;
+      const x = marginLeft + plotW * (1 - ((nowEpoch - t) / 60) / windowMinutes);
+      ctx.beginPath();
+      ctx.moveTo(x, marginTop);
+      ctx.lineTo(x, marginTop + plotH);
+      ctx.stroke();
+      const lbl = dayNames[day.getDay()] + ' ' + day.getDate();
+      if (x + 2 + ctx.measureText(lbl).width <= w) ctx.fillText(lbl, x + 2, h - 3);
+      day.setDate(day.getDate() - 1);
+      day.setHours(0, 0, 0, 0);
+    }
+  } else if (timeSynced && nowEpoch > 0) {
     // реальное время известно (NTP) - линии рисуем СТРОГО на ровных часах
     // (минута = 00), а не через фиксированный шаг назад от "сейчас" - так
     // линия и её подпись всегда совпадают с началом часа на настенных часах.
@@ -2727,6 +2849,7 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
       if (lineNum % labelEvery === 0) {
         let label;
         if (m === 0) label = 'now';
+        else if (gridStepMin === 1440) label = '-' + (m / 1440) + 'd';
         else if (m < 60) label = '-' + m + 'm';
         else label = '-' + (m % 60 === 0 ? (m / 60) : (m / 60).toFixed(1)) + 'h';
         ctx.fillText(label, Math.max(marginLeft, x - 12), h - 3);
@@ -2747,7 +2870,7 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
     for (let i = 0; i < n; i++) {
       const v = s.data[i];
       const distFromNewest = (n - 1 - i); // 0 = самая свежая точка
-      const x = marginLeft + plotW * (1 - distFromNewest / windowMinutes);
+      const x = marginLeft + plotW * (1 - distFromNewest * step / windowMinutes);
       if (v === null) { started = false; continue; }
       const y = marginTop + plotH * (1 - (v - minV) / (maxV - minV));
       if (!started) { ctx.moveTo(x, y); started = true; }
@@ -2780,11 +2903,11 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
   // значения на момент логирования в точке под курсором/пальцем ---
   if (hoverX !== null && hoverX !== undefined && dataCount > 0) {
     const relX = Math.min(1, Math.max(0, (hoverX - marginLeft) / plotW));
-    const distFromNewest = Math.round((1 - relX) * windowMinutes);
+    const distFromNewest = Math.round((1 - relX) * windowMinutes / step);
     const idx = dataCount - 1 - distFromNewest;
 
     if (idx >= 0 && idx < dataCount) {
-      const cx = marginLeft + plotW * (1 - distFromNewest / windowMinutes);
+      const cx = marginLeft + plotW * (1 - distFromNewest * step / windowMinutes);
 
       ctx.save();
       ctx.strokeStyle = '#999';
@@ -2797,12 +2920,12 @@ function drawChart(canvas, seriesList, maxSlots, forcePositive, timeSynced, nowE
 
       let timeLabel;
       if (timeSynced && nowEpoch > 0) {
-        const ts = new Date((nowEpoch - distFromNewest * 60) * 1000);
+        const ts = new Date((nowEpoch - distFromNewest * step * 60) * 1000);
         const hh = ('0' + ts.getHours()).slice(-2);
         const mm = ('0' + ts.getMinutes()).slice(-2);
-        timeLabel = hh + ':' + mm;
+        timeLabel = (step > 1 ? ts.getDate() + '.' + ('0' + (ts.getMonth() + 1)).slice(-2) + ' ' : '') + hh + ':' + mm;
       } else {
-        timeLabel = distFromNewest === 0 ? 'сейчас' : ('-' + distFromNewest + ' мин');
+        timeLabel = distFromNewest === 0 ? 'сейчас' : ('-' + (distFromNewest * step) + ' мин');
       }
 
       const lines = [timeLabel];
@@ -2864,22 +2987,23 @@ function redrawCharts() {
     { data: conv10(d.out), color: '#4da6ff', label: 'Снаружи', unit: '°C', decimals: 1 },
     { data: conv10(d.air), color: '#fff', label: 'Внутри', unit: '°C', decimals: 1 },
     { data: conv10(d.mat), color: '#ff5c5c', label: 'Внизу', unit: '°C', decimals: 1 }
-  ], d.maxCount, false, d.timeSynced, d.nowEpoch, tempHoverX, true);
+  ], d.maxCount, false, d.timeSynced, d.nowEpoch, tempHoverX, true, d.intervalSec / 60);
 
   drawChart(document.getElementById('curChart'), [
     { data: d.currentMa, color: '#ffa64d', label: 'Ток', unit: ' мА', decimals: 0 }
-  ], d.maxCount, true, d.timeSynced, d.nowEpoch, null, false);
+  ], d.maxCount, true, d.timeSynced, d.nowEpoch, null, false, d.intervalSec / 60);
 }
 
 // --- накопленная на клиенте история ---
-// Первый запрос забирает всю историю целиком, дальше каждые 20 с запрашиваются
-// только НОВЫЕ точки (since = сквозной номер последней полученной точки,
-// boot = идентификатор запуска контроллера). Если контроллер перезагрузился или
-// клиент отстал настолько, что часть точек уже вытеснена из буфера,
-// контроллер сам отвечает полной историей ("full":true), и мы её заменяем.
-let histArrays = null;   // { out: [], air: [], mat: [], currentMa: [] }
-let histTotal = 0;
-let histBoot = 0;
+// Для каждого диапазона ('day' - 24 ч по минутам, 'week' - 7 суток по 10-минутным
+// средним) хранится своя копия. Первый запрос диапазона забирает всю историю,
+// дальше запрашиваются только НОВЫЕ точки (since = сквозной номер последней
+// полученной точки, boot = идентификатор запуска контроллера). Если контроллер
+// перезагрузился или клиент отстал, он сам отвечает полной историей
+// ("full":true), и мы её заменяем.
+let currentRange = 'day';
+const histStore = { day: null, week: null }; // { arrays, total, boot, view }
+let fetchBusy = false, fetchQueued = false;
 
 function appendTrim(dst, src, maxN) {
   for (let i = 0; i < src.length; i++) dst.push(src[i]);
@@ -2919,36 +3043,76 @@ function parseHistoryBuffer(buf) {
   return d;
 }
 
+function updateInfo(view) {
+  const totalHours = view.count * view.intervalSec / 3600;
+  const span = totalHours >= 48 ? (totalHours / 24).toFixed(1) + ' сут' : totalHours.toFixed(1) + ' ч';
+  const timeStatus = view.timeSynced ? 'время: NTP' : 'время: относительное (нет NTP)';
+  document.getElementById('pointsInfo').textContent = view.count + ' точек (~' + span + '), интервал ' + view.intervalSec + ' с, ' + timeStatus;
+}
+
 function updateGraphs() {
-  const query = histArrays ? ('?since=' + histTotal + '&boot=' + histBoot) : '';
+  // запросы идут строго по одному: иначе два параллельных инкрементальных
+  // запроса с одним и тем же since вернули бы одни и те же точки дважды
+  if (fetchBusy) { fetchQueued = true; return; }
+  fetchBusy = true;
+  const range = currentRange;
+  const st = histStore[range];
+  let query = '?range=' + range;
+  if (st) query += '&since=' + st.total + '&boot=' + st.boot;
   fetch('/api/history' + query).then(function(r){
     if (!r.ok) throw new Error('history HTTP ' + r.status);
     return r.arrayBuffer();
   }).then(function(buf){
     const d = parseHistoryBuffer(buf);
-    if (d.full || !histArrays) {
-      histArrays = { out: d.out, air: d.air, mat: d.mat, currentMa: d.currentMa };
+    let arrays;
+    if (d.full || !st) {
+      arrays = { out: d.out, air: d.air, mat: d.mat, currentMa: d.currentMa };
     } else {
-      appendTrim(histArrays.out, d.out, d.maxCount);
-      appendTrim(histArrays.air, d.air, d.maxCount);
-      appendTrim(histArrays.mat, d.mat, d.maxCount);
-      appendTrim(histArrays.currentMa, d.currentMa, d.maxCount);
+      arrays = st.arrays;
+      appendTrim(arrays.out, d.out, d.maxCount);
+      appendTrim(arrays.air, d.air, d.maxCount);
+      appendTrim(arrays.mat, d.mat, d.maxCount);
+      appendTrim(arrays.currentMa, d.currentMa, d.maxCount);
     }
-    histTotal = d.total;
-    histBoot = d.boot;
-
-    lastHistory = {
-      out: histArrays.out, air: histArrays.air, mat: histArrays.mat, currentMa: histArrays.currentMa,
+    const view = {
+      out: arrays.out, air: arrays.air, mat: arrays.mat, currentMa: arrays.currentMa,
       maxCount: d.maxCount, intervalSec: d.intervalSec,
       timeSynced: d.timeSynced, nowEpoch: d.nowEpoch,
-      count: histArrays.out.length
+      count: arrays.out.length
     };
-    redrawCharts();
-
-    let hours = (lastHistory.count * d.intervalSec / 3600).toFixed(1);
-    let timeStatus = d.timeSynced ? 'время: NTP' : 'время: относительное (нет NTP)';
-    document.getElementById('pointsInfo').textContent = lastHistory.count + ' точек (~' + hours + ' ч), интервал ' + d.intervalSec + ' с, ' + timeStatus;
+    histStore[range] = { arrays: arrays, total: d.total, boot: d.boot, view: view };
+    if (range === currentRange) {
+      lastHistory = view;
+      redrawCharts();
+      updateInfo(view);
+    }
+  }).catch(function(){ /* связь пропала - повторим на следующем тике */ }).then(function(){
+    fetchBusy = false;
+    if (fetchQueued) { fetchQueued = false; updateGraphs(); }
   });
+}
+
+function setRange(r) {
+  if (r === currentRange) return;
+  currentRange = r;
+  document.getElementById('btnDay').className = (r === 'day') ? 'on' : '';
+  document.getElementById('btnWeek').className = (r === 'week') ? 'on' : '';
+  const labels = document.getElementsByClassName('rangeLabel');
+  for (let i = 0; i < labels.length; i++) labels[i].textContent = (r === 'day') ? '24 часа' : '7 дней';
+  const st = histStore[r];
+  if (st) {
+    lastHistory = st.view;
+    redrawCharts();
+    updateInfo(st.view);
+  } else {
+    lastHistory = null;
+    ['tempChart', 'curChart'].forEach(function(id) {
+      const c = document.getElementById(id);
+      c.getContext('2d').clearRect(0, 0, c.width, c.height);
+    });
+    document.getElementById('pointsInfo').textContent = '...';
+  }
+  updateGraphs(); // сразу подтянуть свежие точки выбранного диапазона
 }
 
 // --- наведение мышью / касание пальцем: переводим координату события в
