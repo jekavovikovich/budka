@@ -69,6 +69,9 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <EEPROM.h>
+#include "esp_task_wdt.h"  // сторожевой таймер (watchdog) - см. блок WATCHDOG ниже
+#include "soc/soc.h"       // REG_READ - прямое чтение регистра GPIO в ISR энкодера
+#include "soc/gpio_reg.h"  // GPIO_IN_REG
 
 // ---------------------------------------------------------------------------
 // ПИНЫ
@@ -141,6 +144,27 @@ const int16_t HYSTERESIS_TENTHS  = 5;      // ±0.5°C
 // --- аварийная температура коврика ---
 const int16_t MAT_TEMP_ALARM_TENTHS = 480; // 48.0°C - выше этого разрыв ЭМР
                                             // (плёнка ограничена 40°C, запас)
+// Перегрев подтверждается несколькими ПОДРЯД свежими чтениями (а не одним) -
+// одиночный выброс из-за наводки не должен навсегда защёлкивать аварию.
+// При опросе раз в TEMP_POLL_INTERVAL_MS (5 с) 2 чтения = ~10 с задержки.
+const uint8_t MAT_OVERHEAT_CONFIRM_COUNT = 2;
+
+// DS18B20 после сброса питания/сбоя отдаёт ровно 85.0 °C (значение по
+// умолчанию регистра температуры). В будке такой температуры не бывает, так
+// что это чтение всегда считается недействительным (см. isPlausibleRaw()).
+const int16_t DS18B20_POWER_ON_RESET_RAW = 85 * 128; // 85.0 °C в единицах 1/128 °C
+
+// Сколько ПОДРЯД хороших проверок нужно, чтобы автоматически снять "мягкую"
+// аварию (отказ датчика воздуха/коврика, обрыв нагрузки). "Жёсткие" аварии
+// (перегрев, превышение тока, залипание SSR) по-прежнему держатся до
+// перезагрузки контроллера.
+const uint8_t ALARM_RECOVER_GOOD_COUNT = 3;
+
+// Если от опорного датчика воздуха не было ни одного успешного чтения дольше
+// этого времени - его последнее значение считается устаревшим, и обычный
+// гистерезис по нему больше не применяется (нагрев выключается), не дожидаясь
+// полноценной аварии (она поднимается лишь после исчерпания переинициализаций).
+const unsigned long AIR_DATA_STALE_MS = 90UL * 1000UL;
 
 // --- калибровка RMS (в отсчётах АЦП) -> реальный ток в мА ---
 // !!! ЗАГЛУШКИ. Откалибровать так: включить нагреватель, замерить реальный
@@ -227,6 +251,57 @@ const unsigned long SSR_STARTUP_DELAY_MS = 30000;
 const unsigned long CURRENT_CHECK_BLANKING_MS = 5000;
 
 // ---------------------------------------------------------------------------
+// WATCHDOG (сторожевой таймер)
+// ---------------------------------------------------------------------------
+// Если loop() зависнет (например, застрянет сетевой вызов) при включённом
+// SSR, нагрев остался бы включённым без какого-либо контроля тока и
+// температуры. Сторожевой таймер перезагружает контроллер, если loop() не
+// "отметился" за WDT_TIMEOUT_S секунд; после перезагрузки срабатывают
+// стартовые задержки ЭМР/SSR (см. EMR_STARTUP_DELAY_MS, SSR_STARTUP_DELAY_MS).
+//
+// На время заведомо долгих блокирующих сетевых операций (проверка версии и
+// скачивание прошивки по OTA) таймер временно отключается - см. WdtPause.
+const uint32_t WDT_TIMEOUT_S = 10;
+bool wdtEnabled = false;
+
+void wdtStart() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  esp_task_wdt_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.timeout_ms = WDT_TIMEOUT_S * 1000;
+  cfg.idle_core_mask = 0;   // следим только за задачей loop(), не за idle-задачами
+  cfg.trigger_panic = true; // по срабатыванию - перезагрузка
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK) {
+    esp_task_wdt_init(&cfg);
+  }
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL); // подписываем текущую задачу (loop)
+  wdtEnabled = true;
+}
+
+inline void wdtFeed() {
+  if (wdtEnabled) esp_task_wdt_reset();
+}
+
+// RAII-пауза: на время жизни объекта loop() не контролируется watchdog'ом,
+// при выходе из области видимости (в т.ч. по любому return) контроль
+// возвращается, а таймер "обнуляется".
+struct WdtPause {
+  bool wasEnabled;
+  WdtPause() : wasEnabled(wdtEnabled) {
+    if (wasEnabled) esp_task_wdt_delete(NULL);
+  }
+  ~WdtPause() {
+    if (wasEnabled) {
+      esp_task_wdt_add(NULL);
+      esp_task_wdt_reset();
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
 // ОБЪЕКТЫ
 // ---------------------------------------------------------------------------
 OneWire oneWireMat(PIN_DS_MAT);
@@ -265,6 +340,14 @@ uint16_t airErrorStreak = 0;
 // переинициализация датчика работает одинаково для всех трёх)
 uint16_t matErrorStreak = 0;
 uint16_t outErrorStreak = 0;
+
+// счётчики ПОДРЯД идущих хороших чтений - для автосброса "мягких" аварий
+uint8_t airGoodStreak = 0;
+uint8_t matGoodStreak = 0;
+uint8_t matOverheatCounter = 0;    // сколько подряд свежих чтений коврика выше порога
+uint8_t openLoadGoodCounter = 0;   // сколько подряд проверок тока при включенном SSR в норме
+unsigned long tempAirLastGoodMs = 0; // когда в последний раз успешно прочитан датчик воздуха
+bool tempPollCompletedOnce = false;  // true после первого полностью завершённого цикла опроса
 
 // сколько попыток переинициализации уже сделано подряд для каждого датчика
 // (сбрасывается в 0 при любом успешном чтении)
@@ -433,7 +516,14 @@ const int EMR_DEENERGIZED_LEVEL = HIGH; // уровень аварии/сбро�
 // state = (A<<1)|B, индекс таблицы = (предыдущее_state<<2)|текущее_state
 // Таблица инвертирована относительно "стандартной" (знаки поменяны местами),
 // т.к. на практике для конкретного энкодера направление оказалось обратным.
-const int8_t ENCODER_TRANSITION_TABLE[16] = {
+//
+// ВАЖНО: таблица помечена DRAM_ATTR - константные массивы по умолчанию лежат
+// во флеш-памяти, а обработчик прерывания может сработать в момент записи во
+// флеш (EEPROM.commit(), OTA), когда флеш недоступен - это вызвало бы сбой.
+// По той же причине пины читаются прямым чтением регистра GPIO (оба сразу, за
+// одну операцию), а не через digitalRead(), который не гарантированно
+// размещён в IRAM.
+DRAM_ATTR const int8_t ENCODER_TRANSITION_TABLE[16] = {
    0,  1, -1,  0,
   -1,  0,  0,  1,
    1,  0,  0, -1,
@@ -444,8 +534,9 @@ volatile uint8_t encoderPrevState = 0;
 volatile int32_t encoderRawDelta = 0;
 
 void IRAM_ATTR encoderISR() {
-  uint8_t a = digitalRead(PIN_ENC_A);
-  uint8_t b = digitalRead(PIN_ENC_B);
+  uint32_t gpioIn = REG_READ(GPIO_IN_REG); // GPIO 0..31 одним чтением (пины 25 и 26 - в этом диапазоне)
+  uint8_t a = (gpioIn >> PIN_ENC_A) & 1;
+  uint8_t b = (gpioIn >> PIN_ENC_B) & 1;
   uint8_t currState = (a << 1) | b;
   uint8_t index = (encoderPrevState << 2) | currState;
   encoderRawDelta += ENCODER_TRANSITION_TABLE[index];
@@ -591,6 +682,12 @@ void loadSetpointFromEeprom() {
 }
 
 void saveSetpointToEeprom(int8_t value) {
+  // флеш-память изнашивается от записей - если там уже лежит то же значение,
+  // ничего не пишем
+  if (EEPROM.read(EEPROM_ADDR_MAGIC) == EEPROM_MAGIC_VALUE &&
+      (int8_t)EEPROM.read(EEPROM_ADDR_SETPOINT) == value) {
+    return;
+  }
   EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_VALUE);
   EEPROM.write(EEPROM_ADDR_SETPOINT, (uint8_t)value);
   EEPROM.commit();
@@ -617,6 +714,10 @@ String loadOtaDeclinedVersion() {
 }
 
 void saveOtaDeclinedVersion(const String &version) {
+  // то же самое, что и для уставки: не пишем во флеш, если версия уже сохранена
+  if (loadOtaDeclinedVersion() == version) {
+    return;
+  }
   EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_VALUE);
 
   uint8_t len = (uint8_t)min((size_t)15, version.length());
@@ -638,9 +739,17 @@ int16_t rawToTenths(int16_t raw) {
     return -1270; // условный код "нет связи с датчиком" (-127.0°C, как у DallasTemperature)
   }
   // raw в единицах 1/128, переводим в 1/10 через целочисленную арифметику
+  // с ОКРУГЛЕНИЕМ до ближайшего (а не усечением к нулю): 5/64 == 10/128
   int32_t t = (int32_t)raw * 5;
-  t = t / 64; // 5/64 == 10/128
+  t = (t >= 0) ? (t + 32) / 64 : (t - 32) / 64;
   return (int16_t)t;
+}
+
+// Чтение пригодно к использованию: датчик отвечает И это не "заводское"
+// значение 85.0 °C, которое DS18B20 отдаёт после сброса питания (см.
+// DS18B20_POWER_ON_RESET_RAW).
+bool isPlausibleRaw(int16_t raw) {
+  return raw != DEVICE_DISCONNECTED_RAW && raw != DS18B20_POWER_ON_RESET_RAW;
 }
 
 // ---------------------------------------------------------------------------
@@ -780,18 +889,38 @@ unsigned long tpOutStartMs = 0;
 void readAllTemperatureResults() {
   if (matFound) {
     int16_t raw = dsMat.getTemp(addrMat);
-    if (raw == DEVICE_DISCONNECTED_RAW) {
+    if (!isPlausibleRaw(raw)) {
       tempMatError = true; // старое значение tempMat НЕ трогаем
       if (matErrorStreak < 0xFFFF) matErrorStreak++;
+      matGoodStreak = 0;
+      matOverheatCounter = 0; // подтверждение перегрева требует ПОДРЯД свежих чтений
     } else {
       tempMat = rawToTenths(raw);
       tempMatError = false;
       matErrorStreak = 0;
       matReinitAttempts = 0; // связь восстановлена - счётчик попыток тоже сбрасываем
+
+      // автосброс "мягкой" аварии отказа датчика после нескольких хороших чтений
+      if (matGoodStreak < 0xFF) matGoodStreak++;
+      if (matGoodStreak >= ALARM_RECOVER_GOOD_COUNT) {
+        alarmFlags &= ~ALARM_MAT_SENSOR_FAIL;
+      }
+
+      // перегрев коврика: нужно MAT_OVERHEAT_CONFIRM_COUNT свежих чтений подряд
+      if (tempMat > MAT_TEMP_ALARM_TENTHS) {
+        if (matOverheatCounter < 0xFF) matOverheatCounter++;
+        if (matOverheatCounter >= MAT_OVERHEAT_CONFIRM_COUNT) {
+          alarmFlags |= ALARM_MAT_OVERHEAT;
+        }
+      } else {
+        matOverheatCounter = 0;
+      }
     }
   } else {
     tempMatError = true; // датчик вообще не был найден при старте
     if (matErrorStreak < 0xFFFF) matErrorStreak++;
+    matGoodStreak = 0;
+    matOverheatCounter = 0;
   }
   // для коврика ЕСТЬ отдельная авария (см. ALARM_MAT_SENSOR_FAIL) - но она
   // не останавливает нагрев сама по себе, только предупреждает
@@ -802,18 +931,28 @@ void readAllTemperatureResults() {
 
   if (airFound) {
     int16_t raw = dsAir.getTemp(addrAir);
-    if (raw == DEVICE_DISCONNECTED_RAW) {
+    if (!isPlausibleRaw(raw)) {
       tempAirError = true;
       if (airErrorStreak < 0xFFFF) airErrorStreak++;
+      airGoodStreak = 0;
     } else {
       tempAir = rawToTenths(raw);
       tempAirError = false;
+      tempAirLastGoodMs = millis();
       airErrorStreak = 0; // успешное чтение сбрасывает счётчик подряд идущих ошибок
       airReinitAttempts = 0;
+
+      // автосброс аварии отказа опорного датчика после нескольких хороших
+      // чтений подряд - ЭМР снова замкнётся, обычный термостат вернётся
+      if (airGoodStreak < 0xFF) airGoodStreak++;
+      if (airGoodStreak >= ALARM_RECOVER_GOOD_COUNT) {
+        alarmFlags &= ~ALARM_AIR_SENSOR_FAIL;
+      }
     }
   } else {
     tempAirError = true;
     if (airErrorStreak < 0xFFFF) airErrorStreak++;
+    airGoodStreak = 0;
   }
   // для опорного датчика переинициализация - это ПОСЛЕДНИЙ ШАНС перед
   // аварией: авария поднимается только когда попытки уже исчерпаны
@@ -824,7 +963,7 @@ void readAllTemperatureResults() {
 
   if (outFound) {
     int16_t raw = dsOut.getTemp(addrOut);
-    if (raw == DEVICE_DISCONNECTED_RAW) {
+    if (!isPlausibleRaw(raw)) {
       tempOutError = true;
       if (outErrorStreak < 0xFFFF) outErrorStreak++;
     } else {
@@ -839,7 +978,7 @@ void readAllTemperatureResults() {
   }
   handleSensorErrorStreak(outErrorStreak, outReinitAttempts, dsOut, outFound, addrOut);
 
-  checkMatOverheat();
+  tempPollCompletedOnce = true;
 }
 
 // Запускает новый цикл опроса (вызывается из loop() по таймеру TEMP_POLL_INTERVAL_MS,
@@ -931,6 +1070,13 @@ void updateThermostat() {
       emergencyTimerInitialized = false;
       newSsrState = false;
     }
+  } else if (millis() - tempAirLastGoodMs > AIR_DATA_STALE_MS) {
+    // авария датчика ещё не поднята (идут переинициализации), но свежих
+    // данных уже давно нет - по устаревшему значению гистерезис не применяем,
+    // нагрев выключается. Если связь восстановится, управление вернётся само.
+    emergencyModeActive = false;
+    emergencyTimerInitialized = false;
+    newSsrState = false;
   } else {
     // штатный режим - обычный гистерезис по опорному датчику
     emergencyModeActive = false;
@@ -958,14 +1104,9 @@ void updateThermostat() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// АВАРИЙНАЯ ЗАЩИТА ПО ТЕМПЕРАТУРЕ КОВРИКА
-// ---------------------------------------------------------------------------
-void checkMatOverheat() {
-  if (tempMat != -1270 && tempMat > MAT_TEMP_ALARM_TENTHS) {
-    alarmFlags |= ALARM_MAT_OVERHEAT;
-  }
-}
+// Аварийная защита по температуре коврика (ALARM_MAT_OVERHEAT) проверяется
+// прямо в readAllTemperatureResults() - только по СВЕЖИМ чтениям, с
+// подтверждением несколькими подряд (см. MAT_OVERHEAT_CONFIRM_COUNT).
 
 // ---------------------------------------------------------------------------
 // АВАРИЙНАЯ ЗАЩИТА ПО ТОКУ (КЗ / обрыв / залипание SSR)
@@ -1101,12 +1242,22 @@ void evaluateAveragedCurrent(int rms) {
     }
 
     if (currentAmpsHundredths < CURRENT_OPEN_LOAD_HUNDREDTHS) {
+      openLoadGoodCounter = 0;
       openLoadCounter++;
       if (openLoadCounter >= CURRENT_FAULT_CONFIRM_COUNT) {
         alarmFlags |= ALARM_OPEN_LOAD; // не разрываем ЭМР - не опасно, просто сигнал
       }
     } else {
       openLoadCounter = 0;
+      // ток снова в норме - после нескольких таких проверок подряд аварию
+      // обрыва нагрузки снимаем автоматически (она ничего не размыкает)
+      if (alarmFlags & ALARM_OPEN_LOAD) {
+        openLoadGoodCounter++;
+        if (openLoadGoodCounter >= ALARM_RECOVER_GOOD_COUNT) {
+          alarmFlags &= ~ALARM_OPEN_LOAD;
+          openLoadGoodCounter = 0;
+        }
+      }
     }
   } else {
     // SSR должен быть выключен: проверяем, что тока действительно нет (не залип).
@@ -1324,8 +1475,19 @@ void drawStaticLabels() {
 // нужен). Перерисовывается только при реальном изменении содержимого
 // (смена статуса, IP или минуты текущего времени).
 String lastShownWifiLine = "";
+unsigned long lastWifiStatusCheckMs = 0;
 
 void drawWifiStatus() {
+  // Строка собирается из String'ов (IP, время) - делать это на каждой
+  // итерации loop() (тысячи раз в секунду) незачем: пересчитываем раз в
+  // секунду. Сброс трекера (lastShownWifiLine == "", см. forceNormalScreenRedraw())
+  // форсирует немедленную отрисовку без ожидания.
+  unsigned long nowMs = millis();
+  if (lastShownWifiLine.length() > 0 && (nowMs - lastWifiStatusCheckMs) < 1000) {
+    return;
+  }
+  lastWifiStatusCheckMs = nowMs;
+
   String wifiPart;
   if (wifiState == WIFI_ST_CONNECTED) {
     wifiPart = "WiFi: OK  " + WiFi.localIP().toString();
@@ -1789,7 +1951,7 @@ const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/jekavovikovich
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.0.0";
+const char* FIRMWARE_VERSION = "1.1.3";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -1839,6 +2001,10 @@ bool isVersionNewer(const String &remoteVersion, const String &currentVersion) {
 void checkForFirmwareUpdate() {
   if (wifiState != WIFI_ST_CONNECTED) return;
 
+  // TLS-рукопожатие и ожидание ответа могут занять несколько секунд - на это
+  // время watchdog приостанавливается (возобновится сам при выходе из функции)
+  WdtPause wdtPause;
+
   WiFiClientSecure client;
   // ВАЖНО: проверка сертификата сервера ОТКЛЮЧЕНА (см. пояснение в начале
   // этого блока про хрупкость пиновки конкретного корневого сертификата
@@ -1850,6 +2016,8 @@ void checkForFirmwareUpdate() {
   client.setInsecure();
 
   HTTPClient http;
+  http.setConnectTimeout(4000); // не ждём связь с GitHub дольше, чем нужно
+  http.setTimeout(4000);
   if (!http.begin(client, OTA_VERSION_URL)) return;
 
   int httpCode = http.GET();
@@ -1907,6 +2075,15 @@ void updateOtaCheck() {
 // прикроет переходный период.
 void performFirmwareUpdate() {
   otaUpdateInProgress = true;
+
+  // Скачивание блокирует loop() на десятки секунд - в это время ни ток, ни
+  // температура не контролируются. Поэтому нагрев на время обновления
+  // принудительно выключаем (термостат сам включит его обратно при необходимости
+  // после возврата управления в loop()), а watchdog приостанавливаем.
+  ssrState = false;
+  digitalWrite(PIN_SSR, SSR_INACTIVE_LEVEL);
+  lastSsrTransitionMs = millis();
+  WdtPause wdtPause;
 
   WiFiClientSecure client;
   client.setInsecure(); // см. пояснение в checkForFirmwareUpdate()
@@ -2023,9 +2200,17 @@ int16_t historyCurrentMa[HISTORY_SIZE];
 uint16_t historyWriteIndex = 0;   // куда писать следующую точку (кольцевой указатель)
 uint16_t historyFilledCount = 0;  // сколько точек реально заполнено (растёт до HISTORY_SIZE, потом остаётся максимумом)
 
+// Сквозной номер записанных точек с момента запуска (не обнуляется при
+// переполнении кольцевого буфера) + идентификатор запуска. По ним страница
+// графиков запрашивает только НОВЫЕ точки (?since=...&boot=...), а не всю
+// историю целиком каждые 20 секунд.
+uint32_t historyTotalSamples = 0;
+uint32_t historyBootId = 0; // выставляется в setup()
+
 unsigned long lastHistorySampleMs = 0;
 
 void recordHistorySample() {
+  historyTotalSamples++;
   historyOut[historyWriteIndex] = tempOut;
   historyAir[historyWriteIndex] = tempAir;
   historyMat[historyWriteIndex] = tempMat;
@@ -2303,38 +2488,96 @@ void handleApiOtaDecline() {
   server.send(200, "text/plain", "OK");
 }
 
-// Добавляет один массив истории в JSON-строку, разворачивая кольцевой
-// буфер в хронологический порядок (от самой старой точки к новой).
-void appendHistoryArray(String &json, const int16_t* data, uint16_t count, uint16_t startIndex) {
-  json += "[";
-  for (uint16_t i = 0; i < count; i++) {
-    uint16_t idx = (startIndex + i) % HISTORY_SIZE;
-    if (i > 0) json += ",";
-    json += String(data[idx]);
+// ---------------------------------------------------------------------------
+// БИНАРНЫЙ ФОРМАТ ОТВЕТА /api/history
+// ---------------------------------------------------------------------------
+// Вместо JSON (4-6 символов на значение, до ~33 КБ на сутки) отдаём сырые
+// int16 - 2 байта на значение. Полный суточный буфер (4 канала x 1440 точек)
+// всегда занимает ровно 32 + 4 x 1440 x 2 = 11 552 байта, то есть укладывается
+// в 16 КБ независимо от значений в данных; размер известен заранее, поэтому
+// ответ уходит с обычным Content-Length (без chunked).
+//
+// Структура ответа (все числа little-endian, как в памяти ESP32):
+//   [0..31]  заголовок HistoryBinHeader: 8 x uint32
+//   далее    count x int16: температура "улица" (десятые доли °C, -1270 = нет данных)
+//            count x int16: температура "воздух"
+//            count x int16: температура "коврик"
+//            count x int16: ток в мА
+// Точки в каждом массиве идут в хронологическом порядке (старая -> новая).
+// Тот же формат разбирается в JS на странице графиков (см. updateGraphs()).
+struct __attribute__((packed)) HistoryBinHeader {
+  uint32_t total;       // сквозной номер последней записанной точки (historyTotalSamples)
+  uint32_t boot;        // идентификатор запуска контроллера (historyBootId)
+  uint32_t count;       // сколько точек в каждом из четырёх массивов
+  uint32_t flags;       // бит 0 - "full" (клиент должен заменить всё накопленное), бит 1 - время синхронизировано по NTP
+  uint32_t nowEpoch;    // текущее время (unix), если timeSynced
+  uint32_t intervalSec; // интервал между точками, секунд
+  uint32_t maxCount;    // ёмкость буфера (HISTORY_SIZE)
+  uint32_t reserved;    // запас на будущее, всегда 0
+};
+static_assert(sizeof(HistoryBinHeader) == 32, "HistoryBinHeader must be exactly 32 bytes");
+
+// Отправляет один канал истории, разворачивая кольцевой буфер в
+// хронологический порядок: сначала кусок от startIndex до конца массива,
+// затем (если буфер "перешагнул" границу) продолжение с начала массива.
+void sendHistoryChannel(const int16_t* data, uint16_t count, uint16_t startIndex) {
+  uint16_t firstPart = HISTORY_SIZE - startIndex;
+  if (firstPart > count) firstPart = count;
+  if (firstPart > 0) {
+    server.sendContent((const char*)&data[startIndex], firstPart * sizeof(int16_t));
   }
-  json += "]";
+  uint16_t secondPart = count - firstPart;
+  if (secondPart > 0) {
+    server.sendContent((const char*)&data[0], secondPart * sizeof(int16_t));
+  }
 }
 
+// Параметры запроса (оба необязательны):
+//   since - сквозной номер последней точки, которую клиент уже получил
+//   boot  - идентификатор запуска контроллера, при котором клиент получал точки
+// Если клиент передал актуальные since и boot, отдаются ТОЛЬКО новые точки
+// (флаг full = 0). Иначе (первый запрос, перезагрузка контроллера, клиент
+// слишком давно не обновлялся и часть точек уже вытеснена) - вся история
+// (флаг full = 1).
 void handleApiHistory() {
-  uint16_t count = historyFilledCount;
-  // индекс самой старой точки в кольцевом буфере
+  uint32_t since = 0;
+  uint32_t clientBoot = 0;
+  if (server.hasArg("since")) since = strtoul(server.arg("since").c_str(), NULL, 10);
+  if (server.hasArg("boot"))  clientBoot = strtoul(server.arg("boot").c_str(), NULL, 10);
+
+  uint16_t filled = historyFilledCount;
+  uint32_t total = historyTotalSamples;
+
+  bool full = true;
+  uint16_t count = filled;
+  if (since > 0 && clientBoot == historyBootId && since <= total && (total - since) <= filled) {
+    full = false;
+    count = (uint16_t)(total - since);
+  }
+
+  // индекс самой старой из отправляемых точек в кольцевом буфере
   uint16_t startIndex = (historyWriteIndex + HISTORY_SIZE - count) % HISTORY_SIZE;
 
-  String json;
-  json.reserve(40000); // грубая оценка максимального размера с запасом - вся история за 24ч
-  json += "{";
-  json += "\"intervalSec\":" + String(HISTORY_SAMPLE_INTERVAL_MS / 1000) + ",";
-  json += "\"maxCount\":" + String(HISTORY_SIZE) + ",";
-  json += "\"timeSynced\":" + String(timeSynced ? "true" : "false") + ",";
-  json += "\"nowEpoch\":" + String((unsigned long)time(nullptr)) + ",";
-  json += "\"count\":" + String(count) + ",";
-  json += "\"out\":";       appendHistoryArray(json, historyOut, count, startIndex);       json += ",";
-  json += "\"air\":";       appendHistoryArray(json, historyAir, count, startIndex);       json += ",";
-  json += "\"mat\":";       appendHistoryArray(json, historyMat, count, startIndex);       json += ",";
-  json += "\"currentMa\":"; appendHistoryArray(json, historyCurrentMa, count, startIndex);
-  json += "}";
+  HistoryBinHeader head;
+  head.total       = total;
+  head.boot        = historyBootId;
+  head.count       = count;
+  head.flags       = (full ? 1u : 0u) | (timeSynced ? 2u : 0u);
+  head.nowEpoch    = (uint32_t)time(nullptr);
+  head.intervalSec = (uint32_t)(HISTORY_SAMPLE_INTERVAL_MS / 1000);
+  head.maxCount    = HISTORY_SIZE;
+  head.reserved    = 0;
 
-  server.send(200, "application/json", json);
+  // размер известен заранее: заголовок + 4 канала по count значений int16
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(sizeof(HistoryBinHeader) + 4u * count * sizeof(int16_t));
+  server.send(200, "application/octet-stream", "");
+
+  server.sendContent((const char*)&head, sizeof(head));
+  sendHistoryChannel(historyOut, count, startIndex);
+  sendHistoryChannel(historyAir, count, startIndex);
+  sendHistoryChannel(historyMat, count, startIndex);
+  sendHistoryChannel(historyCurrentMa, count, startIndex);
 }
 
 // Страница графиков - температуры (в градусах, с точностью 0.1) и ток
@@ -2628,14 +2871,83 @@ function redrawCharts() {
   ], d.maxCount, true, d.timeSynced, d.nowEpoch, null, false);
 }
 
+// --- накопленная на клиенте история ---
+// Первый запрос забирает всю историю целиком, дальше каждые 20 с запрашиваются
+// только НОВЫЕ точки (since = сквозной номер последней полученной точки,
+// boot = идентификатор запуска контроллера). Если контроллер перезагрузился или
+// клиент отстал настолько, что часть точек уже вытеснена из буфера,
+// контроллер сам отвечает полной историей ("full":true), и мы её заменяем.
+let histArrays = null;   // { out: [], air: [], mat: [], currentMa: [] }
+let histTotal = 0;
+let histBoot = 0;
+
+function appendTrim(dst, src, maxN) {
+  for (let i = 0; i < src.length; i++) dst.push(src[i]);
+  if (dst.length > maxN) dst.splice(0, dst.length - maxN);
+}
+
+// Разбор бинарного ответа /api/history (формат описан в прошивке рядом с
+// HistoryBinHeader): 32 байта заголовка (8 x uint32) и затем четыре массива
+// int16 по count значений - улица, воздух, коврик, ток. Всё little-endian.
+// Читаем через DataView с явным указанием порядка байт, а не Int16Array,
+// чтобы результат не зависел от архитектуры устройства, где открыта страница.
+function parseHistoryBuffer(buf) {
+  if (buf.byteLength < 32) throw new Error('short history response');
+  const dv = new DataView(buf);
+  const d = {
+    total:       dv.getUint32(0, true),
+    boot:        dv.getUint32(4, true),
+    count:       dv.getUint32(8, true),
+    full:        (dv.getUint32(12, true) & 1) !== 0,
+    timeSynced:  (dv.getUint32(12, true) & 2) !== 0,
+    nowEpoch:    dv.getUint32(16, true),
+    intervalSec: dv.getUint32(20, true),
+    maxCount:    dv.getUint32(24, true)
+  };
+  if (buf.byteLength !== 32 + d.count * 8) throw new Error('bad history response size');
+
+  function readChannel(index) {
+    const arr = new Array(d.count);
+    const base = 32 + index * d.count * 2;
+    for (let i = 0; i < d.count; i++) arr[i] = dv.getInt16(base + i * 2, true);
+    return arr;
+  }
+  d.out = readChannel(0);
+  d.air = readChannel(1);
+  d.mat = readChannel(2);
+  d.currentMa = readChannel(3);
+  return d;
+}
+
 function updateGraphs() {
-  fetch('/api/history').then(function(r){ return r.json(); }).then(function(d){
-    lastHistory = d;
+  const query = histArrays ? ('?since=' + histTotal + '&boot=' + histBoot) : '';
+  fetch('/api/history' + query).then(function(r){
+    if (!r.ok) throw new Error('history HTTP ' + r.status);
+    return r.arrayBuffer();
+  }).then(function(buf){
+    const d = parseHistoryBuffer(buf);
+    if (d.full || !histArrays) {
+      histArrays = { out: d.out, air: d.air, mat: d.mat, currentMa: d.currentMa };
+    } else {
+      appendTrim(histArrays.out, d.out, d.maxCount);
+      appendTrim(histArrays.air, d.air, d.maxCount);
+      appendTrim(histArrays.mat, d.mat, d.maxCount);
+      appendTrim(histArrays.currentMa, d.currentMa, d.maxCount);
+    }
+    histTotal = d.total;
+    histBoot = d.boot;
+
+    lastHistory = {
+      out: histArrays.out, air: histArrays.air, mat: histArrays.mat, currentMa: histArrays.currentMa,
+      maxCount: d.maxCount, intervalSec: d.intervalSec,
+      timeSynced: d.timeSynced, nowEpoch: d.nowEpoch,
+      count: histArrays.out.length
+    };
     redrawCharts();
 
-    let hours = (d.count * d.intervalSec / 3600).toFixed(1);
+    let hours = (lastHistory.count * d.intervalSec / 3600).toFixed(1);
     let timeStatus = d.timeSynced ? 'время: NTP' : 'время: относительное (нет NTP)';
-    document.getElementById('pointsInfo').textContent = d.count + ' точек (~' + hours + ' ч), интервал ' + d.intervalSec + ' с, ' + timeStatus;
+    document.getElementById('pointsInfo').textContent = lastHistory.count + ' точек (~' + hours + ' ч), интервал ' + d.intervalSec + ' с, ' + timeStatus;
   });
 }
 
@@ -2681,7 +2993,9 @@ attachHoverHandlers(document.getElementById('tempChart'), function(x) { tempHove
 // остаётся с CSS-курсором по умолчанию (свойство cursor:crosshair снято ниже
 // точечно не требуется - карточка тока просто не реагирует на события)
 
-setInterval(updateGraphs, 20000);
+// новая точка истории появляется раз в минуту (HISTORY_SAMPLE_INTERVAL_MS) -
+// чаще опрашивать нет смысла
+setInterval(updateGraphs, 60000);
 updateGraphs();
 </script>
 </body>
@@ -2710,24 +3024,7 @@ void setupWebServer() {
 // SETUP
 // ---------------------------------------------------------------------------
 void setup() {
-  lastEncoderActivityMs = millis(); // отсчёт автовыключения подсветки начинается с момента старта
-
-  // Подтверждаем, что ТЕКУЩАЯ прошивка успешно загрузилась и работает -
-  // это часть защиты от "битого" OTA-обновления: если после прошивки новой
-  // версии устройство не доходит до этой строки (зависает/паникует до
-  // старта) - при следующей перезагрузке загрузчик сам откатится на
-  // предыдущую рабочую версию. Требует, чтобы в Arduino IDE была выбрана
-  // схема разделов с поддержкой OTA (Tools -> Partition Scheme -> любая
-  // с "OTA" в названии) - на схемах без двух app-разделов вызов просто
-  // ничего не делает, без вреда.
-  esp_ota_mark_app_valid_cancel_rollback();
-
-  // --- Wi-Fi и веб-сервер запускаем сразу в начале - подключение идёт в
-  // фоне (неблокирующе), параллельно с остальной инициализацией ниже ---
-  startWifiConnection();
-  setupWebServer();
-
-  // --- пины реле ---
+  // --- пины реле - САМЫМ первым делом, до любой другой инициализации ---
   pinMode(PIN_SSR, OUTPUT);
   digitalWrite(PIN_SSR, SSR_INACTIVE_LEVEL);
 
@@ -2737,10 +3034,27 @@ void setup() {
                                                  // см. updateEmr()/systemReady
   emrClosed = false;
   systemStartMs = millis();
+  lastEncoderActivityMs = millis(); // отсчёт автовыключения подсветки начинается с момента старта
 
-  // --- подсветка ---
+  // --- экран и стартовая заставка с версией - сразу, до инициализации
+  // датчиков (она занимает несколько секунд), чтобы экран не оставался
+  // чёрным. Подсветку включаем только ПОСЛЕ отрисовки заставки (иначе на
+  // долю секунды виден мусор/белый экран).
   pinMode(PIN_TFT_LED, OUTPUT);
+  digitalWrite(PIN_TFT_LED, LOW);
+  tft.init();
+  tft.setRotation(2); // портретная ориентация, перевёрнутая (240 x 320)
+  drawVersionSplashScreen();
   digitalWrite(PIN_TFT_LED, HIGH);
+
+  // идентификатор текущего запуска - нужен странице графиков, чтобы понять,
+  // что контроллер перезагружался и накопленную историю надо запросить заново
+  historyBootId = esp_random() & 0x7FFFFFFF;
+
+  // --- Wi-Fi и веб-сервер запускаем в начале - подключение идёт в фоне
+  // (неблокирующе), параллельно с остальной инициализацией ниже ---
+  startWifiConnection();
+  setupWebServer();
 
   // --- энкодер ---
   pinMode(PIN_ENC_A, INPUT_PULLUP);
@@ -2769,17 +3083,14 @@ void setup() {
   EEPROM.begin(EEPROM_SIZE);
   loadSetpointFromEeprom();
 
-  // --- датчики температуры ---
+  // --- датчики температуры (блокирует на несколько секунд - заставка с
+  // версией уже на экране) ---
   initSensors();
 
-  // --- экран ---
-  tft.init();
-  tft.setRotation(2); // портретная ориентация, перевёрнутая (240 x 320)
-
-  // сначала - экран с версией прошивки (см. VERSION_SPLASH_DURATION_MS),
-  // обычный экран с показаниями появится сам по себе через updateDisplay()
-  // в loop(), как только время сплэша истечёт
-  drawVersionSplashScreen();
+  // Отсчёт 5 секунд показа версии (см. VERSION_SPLASH_DURATION_MS) начинаем
+  // только теперь, когда блокирующая инициализация закончилась - иначе часть
+  // времени заставки "съедалась" бы инициализацией датчиков. Обычный экран с
+  // показаниями появится сам через updateDisplay() в loop().
   versionSplashStartMs = millis();
 
   // первый цикл опроса запускается сразу (не дожидаясь TEMP_POLL_INTERVAL_MS),
@@ -2787,6 +3098,10 @@ void setup() {
   // итераций loop() (см. updateTempPollStateMachine())
   startTempPollCycle();
   updateDisplay();
+
+  // watchdog включаем в самом конце setup() - вся блокирующая инициализация
+  // позади, дальше loop() обязан "отмечаться" не реже WDT_TIMEOUT_S секунд
+  wdtStart();
 }
 
 // ---------------------------------------------------------------------------
@@ -2795,7 +3110,32 @@ void setup() {
 unsigned long lastTempPollMs = 0;
 unsigned long lastCurrentDisplayMs = 0;
 
+// Откат неудачного OTA-обновления: новая прошивка помечается как рабочая
+// НЕ сразу при старте, а только после того, как она прожила
+// OTA_VALIDATE_AFTER_MS и полностью отработала хотя бы один цикл опроса
+// датчиков. Если до этого момента устройство упадёт/зависнет (watchdog) и
+// перезагрузится, загрузчик вернётся на предыдущую прошивку - но только если
+// в нём включён откат (в стандартной сборке ядра Arduino ESP32 это зависит от
+// версии ядра; без поддержки вызов ниже просто ничего не делает).
+const unsigned long OTA_VALIDATE_AFTER_MS = 60UL * 1000UL;
+bool otaImageMarkedValid = false;
+
+// Говорит ядру Arduino ESP32 НЕ помечать прошивку рабочей автоматически
+// перед setup() (если откат в сборке включён) - решение принимаем сами, см.
+// выше. Если ядро этой функции не знает - она просто не вызывается.
+extern "C" bool verifyRollbackLater() {
+  return true;
+}
+
 void loop() {
+  wdtFeed();
+
+  if (!otaImageMarkedValid && tempPollCompletedOnce &&
+      (millis() - systemStartMs >= OTA_VALIDATE_AFTER_MS)) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    otaImageMarkedValid = true;
+  }
+
   handleButton();
   handleEncoder();
   checkEncoderEditTimeout();
