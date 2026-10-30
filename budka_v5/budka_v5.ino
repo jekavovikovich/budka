@@ -41,8 +41,9 @@
     DS18B20 "улица"   (мониторинг)         GPIO27
     Энкодер: A=25 B=26 SW(кнопка)=33
     SSR  -> GPIO17
-    EMR  -> GPIO32  (HIGH = катушка запитана = цепь ЗАМКНУТА, штатный режим;
-                      LOW  = авария/сброс питания = цепь РАЗОМКНУТА, fail-safe)
+    EMR  -> GPIO32  (LOW  = катушка запитана = цепь ЗАМКНУТА, штатный режим;
+                      HIGH = авария/сброс питания = цепь РАЗОМКНУТА, fail-safe;
+                      на линии стоит подтяжка к 3,3 В, см. EMR_ENERGIZED_LEVEL)
     Датчик тока (ZMCT103C+LM358) -> GPIO34 (ADC1! НЕ ADC2, т.к. ADC2
                                               конфликтует с Wi-Fi)
   ============================================================================
@@ -69,6 +70,9 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <EEPROM.h>
+#include <Preferences.h>  // NVS - журнал перезагрузок (блок ДИАГНОСТИКА)
+#include "esp_system.h"   // esp_reset_reason()
+#include "esp_timer.h"    // esp_timer_get_time() - время работы без переполнения millis()
 #include "esp_task_wdt.h"  // сторожевой таймер (watchdog) - см. блок WATCHDOG ниже
 #include "soc/soc.h"       // REG_READ - прямое чтение регистра GPIO в ISR энкодера
 #include "soc/gpio_reg.h"  // GPIO_IN_REG
@@ -532,6 +536,13 @@ DRAM_ATTR const int8_t ENCODER_TRANSITION_TABLE[16] = {
 
 volatile uint8_t encoderPrevState = 0;
 volatile int32_t encoderRawDelta = 0;
+// Диагностика помех на линиях энкодера (см. блок ДИАГНОСТИКА): сколько раз
+// сработало прерывание и сколько из них - "невозможные" переходы (изменились
+// сразу оба сигнала или пропущен промежуточный шаг). При чистых линиях и
+// крутящейся руке невозможных переходов почти нет; всплеск без вращения -
+// признак наводок. Только счётчики, на работу энкодера не влияют.
+volatile uint32_t encoderIsrCount = 0;
+volatile uint32_t encoderInvalidCount = 0;
 
 void IRAM_ATTR encoderISR() {
   uint32_t gpioIn = REG_READ(GPIO_IN_REG); // GPIO 0..31 одним чтением (пины 25 и 26 - в этом диапазоне)
@@ -539,7 +550,10 @@ void IRAM_ATTR encoderISR() {
   uint8_t b = (gpioIn >> PIN_ENC_B) & 1;
   uint8_t currState = (a << 1) | b;
   uint8_t index = (encoderPrevState << 2) | currState;
-  encoderRawDelta += ENCODER_TRANSITION_TABLE[index];
+  int8_t step = ENCODER_TRANSITION_TABLE[index];
+  encoderIsrCount++;
+  if (step == 0 && currState != encoderPrevState) encoderInvalidCount++;
+  encoderRawDelta += step;
   encoderPrevState = currState;
 }
 
@@ -821,6 +835,7 @@ bool handleSensorErrorStreak(uint16_t &errorStreak, uint8_t &reinitAttempts,
 
   if (reinitAttempts < SENSOR_REINIT_MAX_ATTEMPTS) {
     reinitAttempts++;
+    diagSensorReinit((&foundFlag == &matFound) ? 0 : (&foundFlag == &airFound) ? 1 : 2);
     foundFlag = reinitSensor(ds, addr);
     return false; // попытка сделана, финальный вердикт пока не выносим
   }
@@ -891,6 +906,7 @@ void readAllTemperatureResults() {
     int16_t raw = dsMat.getTemp(addrMat);
     if (!isPlausibleRaw(raw)) {
       tempMatError = true; // старое значение tempMat НЕ трогаем
+      diagSensorBad(0, raw);
       if (matErrorStreak < 0xFFFF) matErrorStreak++;
       matGoodStreak = 0;
       matOverheatCounter = 0; // подтверждение перегрева требует ПОДРЯД свежих чтений
@@ -933,6 +949,7 @@ void readAllTemperatureResults() {
     int16_t raw = dsAir.getTemp(addrAir);
     if (!isPlausibleRaw(raw)) {
       tempAirError = true;
+      diagSensorBad(1, raw);
       if (airErrorStreak < 0xFFFF) airErrorStreak++;
       airGoodStreak = 0;
     } else {
@@ -965,6 +982,7 @@ void readAllTemperatureResults() {
     int16_t raw = dsOut.getTemp(addrOut);
     if (!isPlausibleRaw(raw)) {
       tempOutError = true;
+      diagSensorBad(2, raw);
       if (outErrorStreak < 0xFFFF) outErrorStreak++;
     } else {
       tempOut = rawToTenths(raw);
@@ -1948,10 +1966,620 @@ void exitWifiSetupMode() {
 const char* OTA_VERSION_URL  = "https://raw.githubusercontent.com/jekavovikovich/budka/main/firmware/version.json";
 const char* OTA_FIRMWARE_URL = "https://raw.githubusercontent.com/jekavovikovich/budka/main/firmware/firmware.bin";
 
+// ---------------------------------------------------------------------------
+// ДИАГНОСТИКА ПЕРЕЗАГРУЗОК И ЗАВИСАНИЙ
+// ---------------------------------------------------------------------------
+// Цель - после очередного зависания/сброса понять, ПОЧЕМУ он случился.
+// Что запоминается:
+//  - причина последнего сброса (esp_reset_reason()) и счётчики по типам;
+//  - сколько проработал предыдущий запуск и когда была его ПОСЛЕДНЯЯ
+//    активность (по NTP-времени) - т.е. когда примерно всё остановилось;
+//  - этап (место в loop()/setup()), на котором контроллер был в последний момент;
+//  - состояние нагрева (SSR/ЭМР), аварийные флаги и температура воздуха
+//    в этот момент;
+//  - минимум свободной памяти (признак утечки), самая долгая итерация loop(),
+//    разрывы Wi-Fi и их причины.
+// Хранится в двух местах:
+//  - RTC-память (RTC_NOINIT_ATTR): переживает любые сбросы, КРОМЕ полного
+//    пропадания питания; обновляется раз в 10 с - точная картина;
+//  - NVS (флеш): переживает и отключение питания; пишется редко (раз в 10
+//    минут + пара записей за запуск), чтобы не изнашивать флеш. Если питание
+//    пропадало или контроллер перезапускали вручную, "время последней
+//    активности" берётся отсюда с точностью до 10 минут.
+// версия прошивки определена ниже (рядом с OTA), а нужна уже здесь - для баннера в UART
+extern const char* FIRMWARE_VERSION;
+
+const uint32_t DIAG_RTC_MAGIC = 0xB0D0CA7Eu;
+const unsigned long DIAG_RTC_INTERVAL_MS = 10000UL;
+const unsigned long DIAG_NVS_INTERVAL_MS = 10UL * 60UL * 1000UL;
+// Вывод в UART (USB-порт, 115200 бод): баннер при запуске с причиной сброса и
+// данными прошлого запуска, строка состояния раз в DIAG_UART_STATUS_MS и каждое
+// событие сразу. Отключается заменой 1 на 0 - тогда код вывода не компилируется.
+// Тексты в UART - латиницей, чтобы не зависеть от кодировки монитора порта.
+#define DIAG_UART_ENABLED 1
+const unsigned long DIAG_UART_STATUS_MS = 30000UL;
+#if DIAG_UART_ENABLED
+#define DLOG(...) Serial.printf(__VA_ARGS__)
+#else
+#define DLOG(...) do {} while (0)
+#endif
+
+const uint8_t DIAG_LOG_SIZE = 8;       // сколько последних перезагрузок помним
+const uint8_t DIAG_REASON_SLOTS = 16;  // коды esp_reset_reason() 0..15
+
+// этапы работы - номера используются страницей графиков (STAGE_NAMES)
+enum DiagStage : uint8_t {
+  STAGE_LOOP = 0, STAGE_BUTTONS = 1, STAGE_WIFI = 2, STAGE_OTA_CHECK = 3,
+  STAGE_WEB = 4, STAGE_OTA_DOWNLOAD = 5, STAGE_SENSORS = 6, STAGE_CURRENT = 7,
+  STAGE_THERMOSTAT = 8, STAGE_DISPLAY = 9, STAGE_SETUP = 10
+};
+
+// --- лента событий (RAM, последние 32): что и когда происходило -
+// аварии, Wi-Fi, датчики, задержки цикла и т.п. Нужна, чтобы увидеть
+// последовательность событий ПЕРЕД проблемой; после перезагрузки обнуляется
+// (для постоянного следа есть журнал перезагрузок ниже и вывод в UART).
+enum DiagEventType : uint8_t {
+  EV_BOOT = 1, EV_ALARM_SET = 2, EV_ALARM_CLR = 3, EV_WIFI_DOWN = 4, EV_WIFI_UP = 5,
+  EV_NTP = 6, EV_OTA_CHECK = 7, EV_SENSOR_BAD = 8, EV_SENSOR_REINIT = 9, EV_STALL = 10,
+  EV_HEAP = 11, EV_EMERGENCY = 12, EV_EMR = 13, EV_ENC_NOISE = 14
+};
+const char* const DIAG_EVENT_NAMES[15] = {
+  "?", "BOOT", "ALARM_SET", "ALARM_CLEAR", "WIFI_DOWN", "WIFI_UP", "NTP_SYNC", "OTA_CHECK",
+  "SENSOR_BAD", "SENSOR_REINIT", "LOOP_STALL", "HEAP_DROP", "EMERGENCY_MODE", "EMR", "ENC_NOISE"
+};
+struct DiagEvent {             // 20 байт
+  uint32_t uptimeSec;
+  uint32_t epoch;              // 0 - NTP ещё не было
+  int32_t  a;
+  int32_t  b;
+  uint8_t  type;
+  uint8_t  pad[3];
+};
+const uint8_t DIAG_EVENT_RING = 32;
+DiagEvent diagEvents[DIAG_EVENT_RING];
+uint8_t diagEventHead = 0;     // куда писать следующее событие
+uint8_t diagEventCount = 0;
+unsigned long diagEvLastMs[16];
+int32_t diagEvLastA[16];
+uint32_t diagEventSuppressed = 0; // сколько повторов подавлено (одинаковое событие чаще раза в 30 с)
+
+// счётчики датчиков температуры (0 - коврик, 1 - воздух, 2 - улица)
+uint32_t diagSensorDisc[3];    // чтение "нет связи" (-127)
+uint32_t diagSensorPor[3];     // чтение 85.0 °C = датчик перезагрузился по питанию
+uint32_t diagSensorReinits[3]; // сколько раз пытались переинициализировать
+
+uint32_t diagSsrSwitches = 0;
+uint32_t diagEmrSwitches = 0;
+uint32_t diagLoopsPerSec = 0;
+uint32_t diagStackMinFree = 0; // минимум свободного стека loop(), байт
+unsigned long diagWifiUpMs = 0;
+
+struct DiagSnapshot {          // 20 байт: что запоминаем о работающем контроллере
+  uint32_t uptimeSec;
+  uint32_t epoch;              // unix-время, 0 - NTP ещё не было
+  uint32_t minHeap;            // минимум свободной памяти с запуска, байт
+  uint32_t maxLoopMs;          // самая долгая итерация loop() с запуска, мс
+  int16_t  airTenths;          // температура воздуха, десятые доли градуса (-1270 - нет данных)
+  uint8_t  flags;              // bit0 - SSR включён, bit1 - ЭМР замкнут
+  uint8_t  alarms;             // alarmFlags
+};
+
+struct DiagRtcBlock {
+  uint32_t magic;
+  DiagSnapshot snap;
+  uint8_t stage;               // не входит в контрольную сумму - меняется очень часто
+  uint8_t pad[3];
+  uint32_t check;
+};
+RTC_NOINIT_ATTR DiagRtcBlock diagRtc;
+
+struct DiagBootRecord {        // 24 байта: чем закончился предыдущий запуск
+  DiagSnapshot last;
+  uint8_t reason;              // причина сброса, с которого начался СЛЕДУЮЩИЙ запуск
+  uint8_t stage;
+  uint8_t source;              // 0 - данных нет, 1 - из RTC (точно), 2 - из NVS (+-10 мин)
+  uint8_t pad;
+};
+
+DiagBootRecord diagLog[DIAG_LOG_SIZE];   // [0] - самая свежая
+uint8_t diagLogCount = 0;
+uint16_t diagReasonCount[DIAG_REASON_SLOTS];
+uint8_t diagResetReason = 0;
+uint32_t diagMaxLoopMs = 0;
+uint32_t diagWifiConnects = 0;
+uint32_t diagWifiDisconnects = 0;
+uint8_t diagWifiLastReason = 0;
+unsigned long diagLastRtcMs = 0;
+unsigned long diagLastNvsMs = 0;
+// фоновая проверка версии OTA (см. otaCheckTask): сколько раз выполнялась,
+// сколько длилась последняя, чем закончилась (0 - ещё не было, 1 - успешно, 2 - неудача)
+volatile uint32_t diagOtaCheckCount = 0;
+volatile uint32_t diagOtaCheckLastMs = 0;
+volatile uint8_t diagOtaCheckResult = 0;
+
+// Сколько МАКСИМУМ времени (мс) контроллер провёл в каждом этапе за один заход -
+// показывает, какой именно участок loop() блокирует выполнение дольше всего.
+const uint8_t DIAG_STAGE_COUNT = 11;
+uint32_t diagStageMaxMs[DIAG_STAGE_COUNT];
+uint8_t diagStageCur = STAGE_SETUP;
+unsigned long diagStageEnterMs = 0;
+
+void diagStage(uint8_t st) {
+  unsigned long now = millis();
+  if (diagStageCur < DIAG_STAGE_COUNT) {
+    uint32_t dt = (uint32_t)(now - diagStageEnterMs);
+    if (dt > diagStageMaxMs[diagStageCur]) diagStageMaxMs[diagStageCur] = dt;
+    if (dt >= 500 && diagStageCur != STAGE_SETUP) diagEvent(EV_STALL, diagStageCur, (int32_t)dt);
+  }
+  diagStageCur = st;
+  diagStageEnterMs = now;
+  diagRtc.stage = st;
+}
+
+uint32_t diagUptimeSec() { return (uint32_t)(esp_timer_get_time() / 1000000LL); }
+
+uint32_t diagRtcChecksum() {
+  const uint8_t* b = (const uint8_t*)&diagRtc.snap;
+  uint32_t h = DIAG_RTC_MAGIC;
+  for (size_t i = 0; i < sizeof(DiagSnapshot); i++) h = h * 31u + b[i];
+  return h;
+}
+
+// Без параметров намеренно: Arduino генерирует прототипы функций ДО определений
+// структур, поэтому функции с параметрами пользовательских типов здесь не
+// используются. Заполняет diagRtc.snap.
+void diagFillSnapshot() {
+  DiagSnapshot &sn = diagRtc.snap;
+  sn.uptimeSec = diagUptimeSec();
+  sn.epoch     = timeSynced ? (uint32_t)time(nullptr) : 0;
+  sn.minHeap   = ESP.getMinFreeHeap();
+  sn.maxLoopMs = diagMaxLoopMs;
+  sn.airTenths = tempAir;
+  sn.flags     = (ssrState ? 1 : 0) | (emrClosed ? 2 : 0);
+  sn.alarms    = alarmFlags;
+}
+
+// Флаг "сейчас выполняется долгая блокирующая операция" в NVS: если после
+// неё контроллер так и не вернулся (зависание при выключенном watchdog и
+// последующее отключение питания), при следующем запуске по флагу видно, где
+// именно он завис. Пишется только вокруг редких операций.
+void diagBusySet(uint8_t st) {
+  diagStage(st);
+  Preferences pr;
+  if (!pr.begin("diag", false)) return;
+  pr.putUChar("busy", st);
+  pr.end();
+}
+void diagBusyClear() {
+  diagStage(STAGE_LOOP);
+  Preferences pr;
+  if (!pr.begin("diag", false)) return;
+  pr.putUChar("busy", 0);
+  pr.end();
+}
+struct DiagBusy {
+  explicit DiagBusy(uint8_t st) { diagBusySet(st); }
+  ~DiagBusy() { diagBusyClear(); }
+};
+
+const char* diagReasonNameEn(uint8_t r) {
+  switch (r) {
+    case 1: return "POWERON";   case 2: return "EXT_RESET"; case 3: return "SOFTWARE";
+    case 4: return "PANIC";     case 5: return "INT_WDT";   case 6: return "TASK_WDT";
+    case 7: return "OTHER_WDT"; case 8: return "DEEPSLEEP"; case 9: return "BROWNOUT";
+    case 10: return "SDIO";     case 11: return "USB";      case 12: return "JTAG";
+    case 13: return "EFUSE";    case 14: return "PWR_GLITCH"; case 15: return "CPU_LOCKUP";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* diagStageNameEn(uint8_t st) {
+  switch (st) {
+    case STAGE_LOOP: return "loop";           case STAGE_BUTTONS: return "buttons";
+    case STAGE_WIFI: return "wifi/time";      case STAGE_OTA_CHECK: return "ota-check";
+    case STAGE_WEB: return "web";             case STAGE_OTA_DOWNLOAD: return "ota-download";
+    case STAGE_SENSORS: return "sensors";     case STAGE_CURRENT: return "current";
+    case STAGE_THERMOSTAT: return "thermostat"; case STAGE_DISPLAY: return "display";
+    case STAGE_SETUP: return "setup";         default: return "?";
+  }
+}
+
+// Unix-время -> "YYYY-MM-DD hh:mm:ss UTC" (в UART время пишем в UTC, без часовых поясов)
+void diagFmtUtc(char* out, size_t n, uint32_t epoch) {
+  if (epoch == 0) { snprintf(out, n, "unknown"); return; }
+  time_t t = (time_t)epoch;
+  struct tm tmv;
+  gmtime_r(&t, &tmv);
+  snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d UTC", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+           tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+// Добавляет событие в ленту и печатает его в UART. Одинаковое событие (тот же
+// тип и параметр a) чаще раза в 30 с подавляется, чтобы лента и UART не
+// забивались повторами при "дребезге" (счётчики при этом продолжают расти).
+// Вызывается ТОЛЬКО из потока loop().
+void diagEvent(uint8_t type, int32_t a, int32_t b) {
+  unsigned long now = millis();
+  if (type < 16) {
+    if (diagEvLastMs[type] != 0 && diagEvLastA[type] == a && (now - diagEvLastMs[type]) < 30000UL) {
+      diagEventSuppressed++;
+      return;
+    }
+    diagEvLastMs[type] = now;
+    diagEvLastA[type] = a;
+  }
+  DiagEvent &e = diagEvents[diagEventHead];
+  e.uptimeSec = diagUptimeSec();
+  e.epoch = timeSynced ? (uint32_t)time(nullptr) : 0;
+  e.a = a;
+  e.b = b;
+  e.type = type;
+  diagEventHead = (diagEventHead + 1) % DIAG_EVENT_RING;
+  if (diagEventCount < DIAG_EVENT_RING) diagEventCount++;
+  DLOG("[%lus] EVENT %s a=%ld b=%ld\n", (unsigned long)e.uptimeSec,
+       DIAG_EVENT_NAMES[type < 15 ? type : 0], (long)a, (long)b);
+}
+
+// Хуки из кода датчиков: плохое чтение и переинициализация.
+void diagSensorBad(uint8_t idx, int16_t raw) {
+  if (idx > 2) return;
+  if (raw == DS18B20_POWER_ON_RESET_RAW) {
+    diagSensorPor[idx]++;
+    diagEvent(EV_SENSOR_BAD, idx, 85);
+  } else {
+    diagSensorDisc[idx]++;
+    diagEvent(EV_SENSOR_BAD, idx, -127);
+  }
+}
+void diagSensorReinit(uint8_t idx) {
+  if (idx > 2) return;
+  diagSensorReinits[idx]++;
+  diagEvent(EV_SENSOR_REINIT, idx, (int32_t)diagSensorReinits[idx]);
+}
+
+int diagOtaImageState() {
+  esp_ota_img_states_t st;
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  if (run != NULL && esp_ota_get_state_partition(run, &st) == ESP_OK) return (int)st;
+  return -1;
+}
+
+// Вызывается ОДИН раз, в самом начале setup() (после установки безопасных
+// уровней реле): разбирает, чем закончился предыдущий запуск, дописывает это
+// в журнал и заново заводит RTC-блок.
+void diagPrintBootReport();
+
+void diagBoot() {
+#if DIAG_UART_ENABLED
+  Serial.begin(115200);
+#endif
+  esp_reset_reason_t rr = esp_reset_reason();
+  diagResetReason = (uint8_t)rr;
+
+  Preferences pr;
+  bool nvsOk = pr.begin("diag", false);
+
+  DiagBootRecord rec;
+  memset(&rec, 0, sizeof(rec));
+  rec.reason = (uint8_t)rr;
+
+  bool rtcValid = (diagRtc.magic == DIAG_RTC_MAGIC) && (diagRtc.check == diagRtcChecksum());
+  if (rtcValid) {
+    rec.last = diagRtc.snap;
+    rec.stage = diagRtc.stage;
+    rec.source = 1;
+  } else if (nvsOk && pr.getBytesLength("hb") == sizeof(DiagSnapshot)) {
+    pr.getBytes("hb", &rec.last, sizeof(DiagSnapshot));
+    rec.source = 2;
+  }
+  if (nvsOk) {
+    uint8_t busy = pr.getUChar("busy", 0);
+    if (busy != 0) rec.stage = busy; // прошлый запуск не вышел из долгой операции
+  }
+
+  diagLogCount = 0;
+  if (nvsOk) {
+    size_t n = pr.getBytesLength("log");
+    if (n > 0 && (n % sizeof(DiagBootRecord)) == 0 && n <= sizeof(diagLog)) {
+      pr.getBytes("log", diagLog, n);
+      diagLogCount = (uint8_t)(n / sizeof(DiagBootRecord));
+    }
+    if (pr.getBytesLength("cnt") == sizeof(diagReasonCount)) {
+      pr.getBytes("cnt", diagReasonCount, sizeof(diagReasonCount));
+    }
+  }
+  if (diagLogCount > DIAG_LOG_SIZE - 1) diagLogCount = DIAG_LOG_SIZE - 1;
+  for (int i = diagLogCount; i > 0; i--) diagLog[i] = diagLog[i - 1];
+  diagLog[0] = rec;
+  diagLogCount++;
+  if (rr < DIAG_REASON_SLOTS && diagReasonCount[rr] < 65535) diagReasonCount[rr]++;
+
+  if (nvsOk) {
+    pr.putBytes("log", diagLog, diagLogCount * sizeof(DiagBootRecord));
+    pr.putBytes("cnt", diagReasonCount, sizeof(diagReasonCount));
+    pr.putUChar("busy", STAGE_SETUP); // снимается в конце setup(): если не снялся - запуск завис/упал при старте
+    pr.end();
+  }
+
+  memset(&diagRtc, 0, sizeof(diagRtc));
+  diagRtc.magic = DIAG_RTC_MAGIC;
+  diagFillSnapshot();
+  diagRtc.stage = STAGE_SETUP;
+  diagRtc.check = diagRtcChecksum();
+  diagLastRtcMs = millis();
+  diagLastNvsMs = millis();
+  diagStageCur = STAGE_SETUP;
+  diagStageEnterMs = millis();
+
+  diagPrintBootReport();
+  diagEvent(EV_BOOT, (int32_t)rr, 0);
+}
+
+// Баннер в UART: версия, причина сброса, чем закончился предыдущий запуск,
+// счётчики сбросов и журнал.
+void diagPrintBootReport() {
+#if DIAG_UART_ENABLED
+  DLOG("\n==================================================\n");
+  DLOG("Kennel Thermostat v%s (built %s %s)\n", FIRMWARE_VERSION, __DATE__, __TIME__);
+  DLOG("Reset reason: %s (%u)\n", diagReasonNameEn(diagResetReason), (unsigned)diagResetReason);
+  DLOG("Chip: %s rev %u, %u MHz, flash %u MB, sketch %u KB (free %u KB)\n", ESP.getChipModel(),
+       (unsigned)ESP.getChipRevision(), (unsigned)ESP.getCpuFreqMHz(), (unsigned)(ESP.getFlashChipSize() / 1048576),
+       (unsigned)(ESP.getSketchSize() / 1024), (unsigned)(ESP.getFreeSketchSpace() / 1024));
+  DLOG("SDK: %s\n", ESP.getSdkVersion());
+  DLOG("Heap: free %u, min %u, max block %u\n", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+       (unsigned)ESP.getMaxAllocHeap());
+  const DiagBootRecord &r = diagLog[0];
+  if (r.source == 0) {
+    DLOG("Previous run: no data\n");
+  } else {
+    char tbuf[40];
+    diagFmtUtc(tbuf, sizeof(tbuf), r.last.epoch);
+    DLOG("Previous run (%s): lasted %lu s, last activity %s, stage '%s'\n",
+         r.source == 1 ? "RTC, exact" : "NVS, +-10min", (unsigned long)r.last.uptimeSec, tbuf, diagStageNameEn(r.stage));
+    DLOG("  SSR=%d EMR=%d air=%d (x0.1C) alarms=0x%02X min_heap=%lu max_loop=%lums\n",
+         (r.last.flags & 1) ? 1 : 0, (r.last.flags & 2) ? 1 : 0, (int)r.last.airTenths,
+         (unsigned)r.last.alarms, (unsigned long)r.last.minHeap, (unsigned long)r.last.maxLoopMs);
+  }
+  DLOG("Reset counters:");
+  for (uint8_t i = 0; i < DIAG_REASON_SLOTS; i++) {
+    if (diagReasonCount[i]) DLOG(" %s=%u", diagReasonNameEn(i), (unsigned)diagReasonCount[i]);
+  }
+  DLOG("\nLog (newest first):\n");
+  for (uint8_t i = 0; i < diagLogCount; i++) {
+    const DiagBootRecord &q = diagLog[i];
+    DLOG("  #%u reason=%s prev_up=%lus stage=%s src=%u\n", (unsigned)(i + 1), diagReasonNameEn(q.reason),
+         (unsigned long)q.last.uptimeSec, diagStageNameEn(q.stage), (unsigned)q.source);
+  }
+  DLOG("==================================================\n");
+#endif
+}
+
+// Строка состояния в UART (раз в DIAG_UART_STATUS_MS).
+void diagPrintStatus() {
+#if DIAG_UART_ENABLED
+  DLOG("[%lus] T out=%d air=%d mat=%d set=%dC SSR=%d EMR=%d I=%dmA alarm=0x%02X emerg=%d | heap=%u/%u/%u wifi=%s rssi=%d disc=%lu | lps=%lu maxloop=%lums stack_free=%lu | encinv=%lu/%lu\n",
+       (unsigned long)diagUptimeSec(), (int)tempOut, (int)tempAir, (int)tempMat, (int)setpointC,
+       ssrState ? 1 : 0, emrClosed ? 1 : 0, (int)currentAmpsHundredths * 10, (unsigned)alarmFlags,
+       emergencyModeActive ? 1 : 0,
+       (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+       wifiState == WIFI_ST_CONNECTED ? "up" : "down", wifiState == WIFI_ST_CONNECTED ? (int)WiFi.RSSI() : 0,
+       (unsigned long)diagWifiDisconnects, (unsigned long)diagLoopsPerSec, (unsigned long)diagMaxLoopMs,
+       (unsigned long)diagStackMinFree, (unsigned long)encoderInvalidCount, (unsigned long)encoderIsrCount);
+#endif
+}
+
+// Вызывается каждую итерацию loop(): считает самую долгую итерацию, следит за
+// изменениями состояния (аварии, SSR/ЭМР, Wi-Fi, время) и пишет их в ленту событий,
+// раз в 10 с обновляет RTC-блок и медленные показатели, раз в 10 минут - NVS,
+// раз в DIAG_UART_STATUS_MS - строку состояния в UART.
+void diagTick() {
+  static unsigned long prevLoopMs = 0;
+  static unsigned long prevSlowMs = 0;
+  static unsigned long lastStatusMs = 0;
+  static uint32_t loopCount = 0, prevLoopCount = 0;
+  static uint32_t prevEncInvalid = 0, heapMinReported = 0;
+  static uint8_t prevAlarm = 0;
+  static bool prevSsr = false, prevEmr = false, prevEmerg = false, prevSync = false;
+  static uint32_t prevDisc = 0, prevConn = 0;
+  unsigned long now = millis();
+
+  loopCount++;
+  if (prevLoopMs != 0) {
+    unsigned long dt = now - prevLoopMs;
+    if (dt > diagMaxLoopMs) diagMaxLoopMs = dt;
+  }
+  prevLoopMs = now;
+  if (prevSlowMs == 0) { prevSlowMs = now; lastStatusMs = now; }
+
+  // --- наблюдатели изменений (дёшево, каждую итерацию) ---
+  uint8_t al = alarmFlags;
+  if (al != prevAlarm) {
+    uint8_t setBits = al & ~prevAlarm;
+    uint8_t clrBits = prevAlarm & ~al;
+    if (setBits) diagEvent(EV_ALARM_SET, setBits, al);
+    if (clrBits) diagEvent(EV_ALARM_CLR, clrBits, al);
+    prevAlarm = al;
+  }
+  if (ssrState != prevSsr) {
+    prevSsr = ssrState;
+    diagSsrSwitches++;
+    DLOG("[%lus] SSR %s (air=%d set=%dC)\n", (unsigned long)diagUptimeSec(), ssrState ? "ON" : "OFF", (int)tempAir, (int)setpointC);
+  }
+  if (emrClosed != prevEmr) {
+    prevEmr = emrClosed;
+    diagEmrSwitches++;
+    diagEvent(EV_EMR, emrClosed ? 1 : 0, 0);
+  }
+  if (emergencyModeActive != prevEmerg) {
+    prevEmerg = emergencyModeActive;
+    diagEvent(EV_EMERGENCY, emergencyModeActive ? 1 : 0, 0);
+  }
+  if (timeSynced && !prevSync) {
+    prevSync = true;
+    diagEvent(EV_NTP, 0, 0);
+  }
+  if (diagWifiDisconnects != prevDisc) {
+    prevDisc = diagWifiDisconnects;
+    diagEvent(EV_WIFI_DOWN, diagWifiLastReason, diagWifiUpMs ? (int32_t)((now - diagWifiUpMs) / 1000) : 0);
+    diagWifiUpMs = 0;
+  }
+  if (diagWifiConnects != prevConn) {
+    prevConn = diagWifiConnects;
+    diagWifiUpMs = now;
+    diagEvent(EV_WIFI_UP, (int32_t)WiFi.RSSI(), (int32_t)diagWifiConnects);
+  }
+
+  // --- раз в 10 с: RTC-блок и медленные показатели ---
+  if (now - diagLastRtcMs >= DIAG_RTC_INTERVAL_MS) {
+    diagLastRtcMs = now;
+    diagFillSnapshot();
+    diagRtc.check = diagRtcChecksum();
+
+    unsigned long span = now - prevSlowMs;
+    if (span > 0) diagLoopsPerSec = (uint32_t)((uint64_t)(loopCount - prevLoopCount) * 1000ULL / span);
+    prevLoopCount = loopCount;
+    prevSlowMs = now;
+
+    uint32_t freeStack = uxTaskGetStackHighWaterMark(NULL);
+    if (diagStackMinFree == 0 || freeStack < diagStackMinFree) diagStackMinFree = freeStack;
+
+    uint32_t mh = ESP.getMinFreeHeap();
+    if (heapMinReported == 0) heapMinReported = mh;
+    if (mh + 8192 <= heapMinReported) { // новый минимум свободной памяти ниже прежнего на 8 КБ и более
+      heapMinReported = mh;
+      diagEvent(EV_HEAP, (int32_t)mh, (int32_t)ESP.getFreeHeap());
+    }
+
+    uint32_t inv = encoderInvalidCount;
+    if (inv - prevEncInvalid >= 5) diagEvent(EV_ENC_NOISE, (int32_t)(inv - prevEncInvalid), (int32_t)inv);
+    prevEncInvalid = inv;
+  }
+
+  if (now - diagLastNvsMs >= DIAG_NVS_INTERVAL_MS) {
+    diagLastNvsMs = now;
+    Preferences pr;
+    if (pr.begin("diag", false)) {
+      pr.putBytes("hb", &diagRtc.snap, sizeof(DiagSnapshot));
+      pr.end();
+    }
+  }
+
+  if (now - lastStatusMs >= DIAG_UART_STATUS_MS) {
+    lastStatusMs = now;
+    diagPrintStatus();
+  }
+}
+
+// События Wi-Fi: считаем подключения/разрывы и запоминаем причину последнего
+// разрыва (только счётчики - обработчик выполняется в потоке событий Wi-Fi).
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2)
+void diagOnWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    diagWifiDisconnects++;
+    diagWifiLastReason = info.wifi_sta_disconnected.reason;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    diagWifiConnects++;
+  }
+}
+#endif
+
+// Строка для вставки в JSON: убираем кавычки и обратные слэши (на всякий случай)
+String diagJsonSafe(const char* in) {
+  String out;
+  if (in == NULL) return out;
+  for (const char* c = in; *c; c++) out += (*c == '"' || *c == '\\' || (unsigned char)*c < 32) ? ' ' : *c;
+  return out;
+}
+
+// JSON для страницы диагностики (/diag): состояние, счётчики, журнал и лента событий.
+void handleApiDiag() {
+  String js;
+  js.reserve(4200);
+  js += F("{\"up\":");   js += diagUptimeSec();
+  js += F(",\"now\":");  js += (timeSynced ? (uint32_t)time(nullptr) : 0u);
+  js += F(",\"rr\":");   js += diagResetReason;
+  js += F(",\"heap\":[");
+  js += ESP.getFreeHeap(); js += ','; js += ESP.getMinFreeHeap(); js += ','; js += ESP.getMaxAllocHeap();
+  js += F("],\"rssi\":"); js += (wifiState == WIFI_ST_CONNECTED ? (int)WiFi.RSSI() : 0);
+  js += F(",\"wc\":");   js += diagWifiConnects;
+  js += F(",\"wd\":");   js += diagWifiDisconnects;
+  js += F(",\"wr\":");   js += diagWifiLastReason;
+  js += F(",\"ml\":");   js += diagMaxLoopMs;
+  js += F(",\"sm\":[");
+  for (uint8_t i = 0; i < DIAG_STAGE_COUNT; i++) {
+    if (i) js += ',';
+    js += diagStageMaxMs[i];
+  }
+  js += F("],\"oc\":[");
+  js += diagOtaCheckCount; js += ','; js += diagOtaCheckLastMs; js += ','; js += diagOtaCheckResult;
+  js += F("],\"cnt\":[");
+  for (uint8_t i = 0; i < DIAG_REASON_SLOTS; i++) {
+    if (i) js += ',';
+    js += diagReasonCount[i];
+  }
+  js += F("]");
+  js += F(",\"st\":[");
+  js += tempOut; js += ','; js += tempAir; js += ','; js += tempMat; js += ',';
+  js += (int)setpointC; js += ','; js += ((int)currentAmpsHundredths * 10); js += ',';
+  js += (ssrState ? 1 : 0); js += ','; js += (emrClosed ? 1 : 0); js += ',';
+  js += alarmFlags; js += ','; js += (emergencyModeActive ? 1 : 0);
+  js += F("],\"sn\":[");
+  {
+    const bool fnd[3] = { matFound, airFound, outFound };
+    const uint16_t streak[3] = { matErrorStreak, airErrorStreak, outErrorStreak };
+    const uint8_t att[3] = { matReinitAttempts, airReinitAttempts, outReinitAttempts };
+    for (uint8_t i = 0; i < 3; i++) {
+      if (i) js += ',';
+      js += '['; js += (fnd[i] ? 1 : 0); js += ','; js += streak[i]; js += ','; js += att[i]; js += ',';
+      js += diagSensorDisc[i]; js += ','; js += diagSensorPor[i]; js += ','; js += diagSensorReinits[i]; js += ']';
+    }
+  }
+  js += F("],\"en\":["); js += encoderIsrCount; js += ','; js += encoderInvalidCount;
+  js += F("],\"cs\":["); js += (int)currentNoiseBaselineRms; js += ','; js += (currentBaselineCalibrated ? 1 : 0);
+  js += F("],\"sy\":[");
+  js += (uint32_t)ESP.getCpuFreqMHz(); js += ','; js += (uint32_t)ESP.getChipRevision(); js += ',';
+  js += (uint32_t)(ESP.getFlashChipSize() / 1048576); js += ','; js += (uint32_t)(ESP.getSketchSize() / 1024); js += ',';
+  js += (uint32_t)(ESP.getFreeSketchSpace() / 1024); js += ','; js += diagStackMinFree; js += ',';
+  js += diagLoopsPerSec; js += ','; js += diagSsrSwitches; js += ','; js += diagEmrSwitches; js += ',';
+  js += diagOtaImageState(); js += ',';
+  js += (wifiState == WIFI_ST_CONNECTED ? (int)WiFi.channel() : 0); js += ',';
+  js += (uint32_t)((wifiState == WIFI_ST_CONNECTED && diagWifiUpMs) ? (millis() - diagWifiUpMs) / 1000 : 0); js += ',';
+  js += diagEventSuppressed;
+  js += F("],\"ip\":\"");
+  if (wifiState == WIFI_ST_CONNECTED) js += WiFi.localIP().toString();
+  js += F("\",\"chip\":\""); js += diagJsonSafe(ESP.getChipModel());
+  js += F("\",\"sdk\":\""); js += diagJsonSafe(ESP.getSdkVersion());
+  js += F("\"");
+  js += F(",\"log\":[");
+  for (uint8_t i = 0; i < diagLogCount; i++) {
+    const DiagBootRecord &r = diagLog[i];
+    char buf[120];
+    snprintf(buf, sizeof(buf), "%s[%u,%u,%u,%lu,%lu,%lu,%lu,%d,%u,%u]",
+             i ? "," : "",
+             (unsigned)r.reason, (unsigned)r.stage, (unsigned)r.source,
+             (unsigned long)r.last.epoch, (unsigned long)r.last.uptimeSec,
+             (unsigned long)r.last.minHeap, (unsigned long)r.last.maxLoopMs,
+             (int)r.last.airTenths, (unsigned)r.last.flags, (unsigned)r.last.alarms);
+    js += buf;
+  }
+  js += F("],\"ev\":[");
+  for (uint8_t i = 0; i < diagEventCount; i++) {
+    uint8_t idx = (uint8_t)((diagEventHead + DIAG_EVENT_RING - 1 - i) % DIAG_EVENT_RING); // от свежих к старым
+    const DiagEvent &e = diagEvents[idx];
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s[%lu,%lu,%u,%ld,%ld]", i ? "," : "",
+             (unsigned long)e.uptimeSec, (unsigned long)e.epoch, (unsigned)e.type, (long)e.a, (long)e.b);
+    js += buf;
+  }
+  js += F("]}");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", js);
+}
+
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.1.4";
+const char* FIRMWARE_VERSION = "1.1.7";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -1993,67 +2621,117 @@ bool isVersionNewer(const String &remoteVersion, const String &currentVersion) {
   return false; // версии равны
 }
 
-// Скачивает version.json и решает, показывать ли баннер обновления.
-// БЛОКИРУЕТ выполнение на время запроса (обычно доли секунды - секунда в
-// локальной сети с нормальным интернетом) - вызывается редко (раз в сутки),
-// это осознанный и ограниченный по времени компромисс, аналогично разовой
-// переинициализации датчиков при длительном отказе.
-void checkForFirmwareUpdate() {
-  if (wifiState != WIFI_ST_CONNECTED) return;
+// Проверка версии прошивки выполняется В ОТДЕЛЬНОЙ ЗАДАЧЕ FreeRTOS, а не в
+// loop(). Раньше она блокировала loop() на всё время DNS + TLS-рукопожатия +
+// ответа (в диагностике - до 7,7 с), причём watchdog на это время отключался:
+// нагрев, датчики, кнопки и веб-сервер в эти секунды не обслуживались, а при
+// пропадании интернета в этот момент блокировка могла затянуться. Теперь
+// сетевая часть живёт в своей задаче на ядре 0 (рядом со стеком Wi-Fi), а
+// loop() только запускает её и забирает готовый результат.
+//
+// Данные между задачей и loop() передаются через простой буфер и флаги (никаких
+// String и EEPROM из задачи): задача пишет буфер, затем поднимает флаг
+// otaCheckResultReady; loop() читает буфер только после флага.
+volatile bool otaCheckTaskRunning = false;
+volatile bool otaCheckResultReady = false;
+volatile bool otaCheckResultOk = false;
+char otaCheckRemoteVersion[16] = "";
 
-  // TLS-рукопожатие и ожидание ответа могут занять несколько секунд - на это
-  // время watchdog приостанавливается (возобновится сам при выходе из функции)
-  WdtPause wdtPause;
+void otaCheckTask(void* arg) {
+  unsigned long startMs = millis();
+  bool ok = false;
+  char ver[16];
+  ver[0] = '\0';
+  {
+    WiFiClientSecure client;
+    // ВАЖНО: проверка сертификата сервера ОТКЛЮЧЕНА (см. пояснение в начале
+    // этого блока про хрупкость пиновки конкретного корневого сертификата
+    // GitHub - он менялся несколько раз за последние годы). Риск: кто-то в
+    // локальной сети между устройством и интернетом теоретически мог бы
+    // подменить ответ. Для домашней сети это принятый компромисс, но при
+    // желании можно заменить на client.setCACert(...) с актуальным
+    // сертификатом raw.githubusercontent.com.
+    client.setInsecure();
+    client.setHandshakeTimeout(10); // TLS-рукопожатие - не дольше 10 с (по умолчанию 120 с)
 
-  WiFiClientSecure client;
-  // ВАЖНО: проверка сертификата сервера ОТКЛЮЧЕНА (см. пояснение в начале
-  // этого блока про хрупкость пиновки конкретного корневого сертификата
-  // GitHub - он менялся несколько раз за последние годы). Риск: кто-то в
-  // локальной сети между устройством и интернетом теоретически мог бы
-  // подменить ответ. Для домашней сети это принятый компромисс, но при
-  // желании можно заменить на client.setCACert(...) с актуальным
-  // сертификатом raw.githubusercontent.com.
-  client.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(4000); // не ждём связь с GitHub дольше, чем нужно
+    http.setTimeout(4000);
+    if (http.begin(client, OTA_VERSION_URL)) {
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
 
-  HTTPClient http;
-  http.setConnectTimeout(4000); // не ждём связь с GitHub дольше, чем нужно
-  http.setTimeout(4000);
-  if (!http.begin(client, OTA_VERSION_URL)) return;
-
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-
-    // простой разбор JSON без библиотек - ищем "version":"X.Y.Z" вручную,
-    // формат файла заведомо простой и полностью под нашим контролем
-    int idx = payload.indexOf("\"version\"");
-    if (idx >= 0) {
-      int colon = payload.indexOf(':', idx);
-      int q1 = payload.indexOf('"', colon + 1);
-      int q2 = payload.indexOf('"', q1 + 1);
-      if (q1 >= 0 && q2 > q1) {
-        String remoteVersion = payload.substring(q1 + 1, q2);
-
-        if (isVersionNewer(remoteVersion, FIRMWARE_VERSION)) {
-          String declined = loadOtaDeclinedVersion();
-          if (declined != remoteVersion) {
-            otaUpdateAvailable = true;
-            otaAvailableVersion = remoteVersion;
+        // простой разбор JSON без библиотек - ищем "version":"X.Y.Z" вручную,
+        // формат файла заведомо простой и полностью под нашим контролем
+        int idx = payload.indexOf("\"version\"");
+        if (idx >= 0) {
+          int colon = payload.indexOf(':', idx);
+          int q1 = payload.indexOf('"', colon + 1);
+          int q2 = payload.indexOf('"', q1 + 1);
+          if (colon >= 0 && q1 >= 0 && q2 > q1) {
+            String remoteVersion = payload.substring(q1 + 1, q2);
+            if (remoteVersion.length() > 0 && remoteVersion.length() < sizeof(ver)) {
+              strcpy(ver, remoteVersion.c_str());
+              ok = true;
+            }
           }
-        } else {
-          otaUpdateAvailable = false;
         }
       }
+      http.end();
     }
-  }
+  } // клиент и HTTP-объект уничтожены ДО удаления задачи
 
-  http.end();
+  strcpy(otaCheckRemoteVersion, ver);
+  otaCheckResultOk = ok;
+  diagOtaCheckLastMs = (uint32_t)(millis() - startMs);
+  diagOtaCheckResult = ok ? 1 : 2;
+  diagOtaCheckCount++;
+  __sync_synchronize();        // данные выше должны быть записаны ДО флага
+  otaCheckResultReady = true;
+  otaCheckTaskRunning = false;
+  vTaskDelete(NULL);
+}
+
+// Запускает фоновую проверку (сама НЕ блокирует и возвращается сразу).
+void checkForFirmwareUpdate() {
+  if (wifiState != WIFI_ST_CONNECTED) return;
+  if (otaCheckTaskRunning || otaUpdateInProgress) return; // предыдущая ещё идёт
+
+  otaCheckTaskRunning = true;
+  otaCheckResultReady = false;
+  // стек 12 КБ: TLS-рукопожатие + HTTPClient (loopTask с 8 КБ справлялся, здесь запас)
+  if (xTaskCreatePinnedToCore(otaCheckTask, "otaCheck", 12288, NULL, 1, NULL, 0) != pdPASS) {
+    otaCheckTaskRunning = false; // не хватило памяти - попробуем в следующие сутки
+  }
+}
+
+// Вызывается из loop(): если фоновая проверка закончилась - применяет результат
+// (баннер "доступно обновление"). Работа с EEPROM (ранее отклонённая версия)
+// и со String выполняется ТОЛЬКО здесь, в потоке loop().
+void processOtaCheckResult() {
+  if (!otaCheckResultReady) return;
+  otaCheckResultReady = false;
+  diagEvent(EV_OTA_CHECK, otaCheckResultOk ? 1 : 2, (int32_t)diagOtaCheckLastMs);
+  if (!otaCheckResultOk) return; // как и раньше: при неудаче баннер не меняем
+
+  String remoteVersion = String(otaCheckRemoteVersion);
+  if (isVersionNewer(remoteVersion, FIRMWARE_VERSION)) {
+    String declined = loadOtaDeclinedVersion();
+    if (declined != remoteVersion) {
+      otaUpdateAvailable = true;
+      otaAvailableVersion = remoteVersion;
+    }
+  } else {
+    otaUpdateAvailable = false;
+  }
 }
 
 // Вызывается каждую итерацию loop() - раз в сутки запускает проверку (см.
 // checkForFirmwareUpdate()), плюс один раз сразу после первого подключения
 // к Wi-Fi, не дожидаясь первых суток.
 void updateOtaCheck() {
+  processOtaCheckResult(); // забрать результат фоновой проверки, если она закончилась
   if (wifiState != WIFI_ST_CONNECTED) return;
 
   unsigned long now = millis();
@@ -2084,11 +2762,15 @@ void performFirmwareUpdate() {
   digitalWrite(PIN_SSR, SSR_INACTIVE_LEVEL);
   lastSsrTransitionMs = millis();
   WdtPause wdtPause;
+  DiagBusy diagBusy(STAGE_OTA_DOWNLOAD);
 
   WiFiClientSecure client;
-  client.setInsecure(); // см. пояснение в checkForFirmwareUpdate()
+  client.setInsecure(); // см. пояснение в otaCheckTask()
+  client.setHandshakeTimeout(10); // раньше таймаутов не было совсем: обрыв связи мог повесить скачивание
 
   HTTPClient http;
+  http.setConnectTimeout(8000);
+  http.setTimeout(15000); // таймаут простоя потока (не общий) - медленная, но живая загрузка не прервётся
   if (!http.begin(client, OTA_FIRMWARE_URL)) {
     otaUpdateInProgress = false;
     return;
@@ -2111,6 +2793,7 @@ void performFirmwareUpdate() {
   http.end();
 
   if (success) {
+    diagBusyClear(); // перезапуск здесь штатный, не зависание
     ESP.restart(); // новая прошивка вступит в силу после перезагрузки
     return;         // сюда управление не дойдёт - для ясности кода
   }
@@ -2696,6 +3379,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
   .info { font-size:12px; color:#777; text-align:center; margin-top:8px; }
   button { width:100%; padding:16px; font-size:19px; background:#444; color:#fff; border:none; border-radius:10px; margin-top:4px; }
   button:active { background:#333; }
+  .card button + button { margin-top:10px; }
   .seg { display:flex; gap:8px; margin-bottom:12px; }
   .seg button { flex:1; padding:10px; font-size:16px; margin-top:0; background:#333; }
   .seg button.on { background:#2a6df5; }
@@ -2725,6 +3409,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
     <div class="info" id="pointsInfo">...</div>
   </div>
   <div class="card">
+    <button onclick="location.href='/diag'">Диагностика</button>
     <button onclick="location.href='/'">Параметры</button>
   </div>
 <script>
@@ -3161,10 +3846,235 @@ attachHoverHandlers(document.getElementById('tempChart'), function(x) { tempHove
 // чаще опрашивать нет смысла
 setInterval(updateGraphs, 60000);
 updateGraphs();
+
 </script>
 </body>
 </html>
 )HTMLPAGE";
+
+const char DIAG_HTML[] PROGMEM = R"HTMLPAGE(
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Будка - диагностика</title>
+<style>
+  body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  .card { background:#222; border-radius:12px; padding:16px; margin-bottom:14px; max-width:420px; margin-left:auto; margin-right:auto; }
+  .title { background:#3a3a3a; margin:-16px -16px 14px -16px; padding:16px; text-align:center; border-radius:12px 12px 0 0; font-size:26px; color:#fff; font-weight:bold; }
+  .info { font-size:12px; color:#777; text-align:center; margin-top:8px; }
+  button { width:100%; padding:16px; font-size:19px; background:#444; color:#fff; border:none; border-radius:10px; margin-top:4px; }
+  button:active { background:#333; }
+  .diag .kv { display:flex; justify-content:space-between; gap:12px; font-size:14px; padding:5px 0; border-bottom:1px solid #2c2c2c; }
+  .diag .kv b { font-weight:normal; color:#aaa; }
+  .diag .kv span { text-align:right; }
+  .diag .ev { font-size:13px; color:#ccc; padding:7px 0; border-bottom:1px solid #2c2c2c; line-height:1.4; }
+  .diag .ev strong { color:#fff; }
+  .diag h3 { font-size:15px; color:#ccc; margin:14px 0 4px 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">Диагностика</div>
+    <div class="diag" id="diagBody">...</div>
+    <div class="info">обновляется раз в 30 секунд</div>
+  </div>
+  <div class="card">
+    <button onclick="location.href='/graphs'">Графики</button>
+  </div>
+<script>
+// --- блок "Диагностика": причина последнего сброса, время работы, журнал
+// перезагрузок (данные отдаёт /api/diag) ---
+const STAGE_NAMES = ['основной цикл', 'кнопки/энкодер', 'Wi-Fi/время', 'проверка версии OTA',
+  'веб-сервер', 'скачивание OTA', 'опрос датчиков', 'датчик тока', 'термостат', 'экран', 'запуск (setup)'];
+const REASON_NAMES = {
+  0: 'неизвестна', 1: 'включение питания', 2: 'сброс по EN', 3: 'программный перезапуск',
+  4: 'сбой программы (паника)', 5: 'зависание прерываний (INT WDT)', 6: 'сторожевой таймер (TASK WDT)',
+  7: 'сторожевой таймер (WDT)', 8: 'выход из сна', 9: 'просадка питания (BROWNOUT)', 10: 'SDIO',
+  11: 'USB', 12: 'JTAG', 13: 'eFuse', 14: 'сбой питания (glitch)', 15: 'зависание процессора'
+};
+const WIFI_REASONS = {
+  2: 'истекла авторизация', 8: 'точка отключила устройство', 15: 'тайм-аут рукопожатия',
+  200: 'потеряны сигналы точки', 201: 'сеть не найдена', 202: 'ошибка аутентификации'
+};
+
+function fmtDur(sec) {
+  if (sec < 60) return sec + ' с';
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  return (d ? d + ' д ' : '') + (d || h ? h + ' ч ' : '') + m + ' мин';
+}
+function fmtTime(epoch) { return new Date(epoch * 1000).toLocaleString('ru-RU'); }
+function reasonName(c) { return REASON_NAMES[c] !== undefined ? REASON_NAMES[c] : ('код ' + c); }
+
+function diagRow(parent, key, value) {
+  const row = document.createElement('div');
+  row.className = 'kv';
+  const k = document.createElement('b'); k.textContent = key;
+  const v = document.createElement('span'); v.textContent = value;
+  row.appendChild(k); row.appendChild(v);
+  parent.appendChild(row);
+}
+
+const ALARM_NAMES = ['перегрев коврика', 'перегрузка по току', 'SSR залип', 'обрыв нагрузки', 'отказ датчика воздуха', 'отказ датчика коврика'];
+const SENSOR_NAMES = ['коврик', 'воздух', 'улица'];
+const OTA_STATES = { '-1': 'нет данных (откат не включён)', 0: 'новая', 1: 'ожидает подтверждения', 2: 'подтверждена', 3: 'неисправна', 4: 'прервана' };
+
+function alarmText(mask) {
+  const out = [];
+  ALARM_NAMES.forEach(function(n, i) { if (mask & (1 << i)) out.push(n); });
+  return out.length ? out.join(', ') : 'нет';
+}
+function t10(v) { return v === -1270 ? '--' : (v / 10).toFixed(1); }
+function kb(v) { return (v / 1024).toFixed(0); }
+
+function eventText(e) {
+  const a = e[3], b = e[4];
+  switch (e[2]) {
+    case 1: return 'Запуск: ' + reasonName(a);
+    case 2: return 'Авария возникла: ' + alarmText(a);
+    case 3: return 'Авария снята: ' + alarmText(a);
+    case 4: return 'Wi-Fi: разрыв, причина ' + (WIFI_REASONS[a] ? WIFI_REASONS[a] + ' (' + a + ')' : 'код ' + a) + (b ? ', был подключён ' + fmtDur(b) : '');
+    case 5: return 'Wi-Fi: подключено, сигнал ' + a + ' дБм (подключение №' + b + ')';
+    case 6: return 'Время синхронизировано (NTP)';
+    case 7: return 'Проверка версии OTA: ' + (a === 1 ? 'успешно' : 'не удалась') + ', ' + b + ' мс';
+    case 8: return 'Датчик «' + SENSOR_NAMES[a] + '»: ' + (b === 85 ? 'ответил 85 °C (датчик перезагрузился по питанию)' : 'нет ответа');
+    case 9: return 'Датчик «' + SENSOR_NAMES[a] + '»: переинициализация №' + b;
+    case 10: return 'Задержка цикла ' + b + ' мс на этапе «' + (STAGE_NAMES[a] !== undefined ? STAGE_NAMES[a] : a) + '»';
+    case 11: return 'Память: новый минимум ' + kb(a) + ' КБ (свободно ' + kb(b) + ' КБ)';
+    case 12: return 'Аварийный таймерный режим ' + (a ? 'включён' : 'выключен');
+    case 13: return 'ЭМР ' + (a ? 'замкнут' : 'разомкнут');
+    case 14: return 'Энкодер: ' + a + ' невозможных переходов за 10 с (помехи?), всего ' + b;
+    default: return 'Событие ' + e[2] + ' (' + a + ', ' + b + ')';
+  }
+}
+
+function sect(box, title) {
+  const h = document.createElement('h3');
+  h.textContent = title;
+  box.appendChild(h);
+}
+
+function renderDiag(d) {
+  const box = document.getElementById('diagBody');
+  while (box.firstChild) box.removeChild(box.firstChild);
+
+  sect(box, 'Состояние сейчас');
+  diagRow(box, 'Температуры: улица / воздух / коврик', t10(d.st[0]) + ' / ' + t10(d.st[1]) + ' / ' + t10(d.st[2]) + ' °C');
+  diagRow(box, 'Уставка', d.st[3] + ' °C');
+  diagRow(box, 'Нагрев', 'SSR ' + (d.st[5] ? 'включён' : 'выключен') + ', ЭМР ' + (d.st[6] ? 'замкнут' : 'разомкнут') + (d.st[8] ? ', аварийный таймерный режим' : ''));
+  diagRow(box, 'Ток нагревателя', d.st[4] + ' мА');
+  diagRow(box, 'Аварии', alarmText(d.st[7]));
+
+  sect(box, 'Работа контроллера');
+  diagRow(box, 'Работает без перезагрузки', fmtDur(d.up) + (d.now ? ' (с ' + fmtTime(d.now - d.up) + ')' : ''));
+  diagRow(box, 'Причина последнего сброса', reasonName(d.rr));
+  diagRow(box, 'Итераций цикла в секунду', d.sy[6]);
+  diagRow(box, 'Самая долгая итерация цикла', d.ml + ' мс');
+  const slow = [];
+  d.sm.forEach(function(ms, i) { if (ms >= 50 && i !== 10) slow.push(STAGE_NAMES[i] + ': ' + ms + ' мс'); });
+  diagRow(box, 'Дольше всего по этапам', slow.length ? slow.join('; ') : 'все этапы быстрее 50 мс');
+  diagRow(box, 'Свободный стек цикла (минимум)', d.sy[5] ? d.sy[5] + ' байт' : 'ещё не измерен');
+  diagRow(box, 'Включений SSR / переключений ЭМР', d.sy[7] + ' / ' + d.sy[8]);
+  diagRow(box, 'Проверка версии (в фоне)', d.oc[0] ? (d.oc[0] + ' раз; последняя ' + d.oc[1] + ' мс, ' + (d.oc[2] === 1 ? 'успешно' : 'не удалась')) : 'ещё не выполнялась');
+  diagRow(box, 'Состояние прошивки (откат OTA)', OTA_STATES[d.sy[9]] !== undefined ? OTA_STATES[d.sy[9]] : ('код ' + d.sy[9]));
+
+  sect(box, 'Память и Wi-Fi');
+  diagRow(box, 'Память: свободно / минимум / крупный блок',
+    kb(d.heap[0]) + ' / ' + kb(d.heap[1]) + ' / ' + kb(d.heap[2]) + ' КБ');
+  diagRow(box, 'Wi-Fi', d.rssi ? (d.rssi + ' дБм, канал ' + d.sy[10] + ', ' + d.ip + ', подключён ' + fmtDur(d.sy[11])) : 'нет связи');
+  diagRow(box, 'Подключений / разрывов', d.wc + ' / ' + d.wd);
+  if (d.wd > 0) diagRow(box, 'Причина последнего разрыва', WIFI_REASONS[d.wr] ? (WIFI_REASONS[d.wr] + ' (' + d.wr + ')') : ('код ' + d.wr));
+
+  sect(box, 'Датчики температуры');
+  d.sn.forEach(function(r, i) {
+    // r: [найден, ошибок подряд, попыток переинициализации, обрывов связи, ответов 85 °C, переинициализаций всего]
+    diagRow(box, SENSOR_NAMES[i], (r[0] ? 'найден' : 'НЕ найден') + '; ошибок подряд ' + r[1] + '; обрывов ' + r[3] + '; ответов 85 °C ' + r[4] + '; переинициализаций ' + r[5]);
+  });
+
+  sect(box, 'Помехи и ток');
+  diagRow(box, 'Энкодер: прерываний / невозможных переходов', d.en[0] + ' / ' + d.en[1]);
+  diagRow(box, 'Датчик тока: шумовой уровень', d.cs[1] ? (d.cs[0] + ' ед. АЦП') : 'не откалиброван');
+
+  sect(box, 'Система');
+  diagRow(box, 'Чип', d.chip + ', ревизия ' + d.sy[1] + ', ' + d.sy[0] + ' МГц, flash ' + d.sy[2] + ' МБ');
+  diagRow(box, 'Прошивка в памяти', d.sy[3] + ' КБ (свободно ' + d.sy[4] + ' КБ)');
+  diagRow(box, 'SDK', d.sdk);
+
+  sect(box, 'События (сверху - самые свежие)');
+  if (d.ev.length === 0) {
+    diagRow(box, 'События', 'пока нет');
+  } else {
+    d.ev.forEach(function(e) {
+      const ev = document.createElement('div');
+      ev.className = 'ev';
+      const when = e[1] ? fmtTime(e[1]) : ('через ' + fmtDur(e[0]) + ' после запуска');
+      const head = document.createElement('strong');
+      head.textContent = when;
+      ev.appendChild(head);
+      const body = document.createElement('div');
+      body.textContent = eventText(e);
+      ev.appendChild(body);
+      box.appendChild(ev);
+    });
+  }
+  if (d.sy[12] > 0) diagRow(box, 'Подавлено повторов событий', d.sy[12]);
+
+  sect(box, 'Сбросы');
+  const parts = [];
+  d.cnt.forEach(function(n, i) { if (n > 0) parts.push(reasonName(i) + ': ' + n); });
+  diagRow(box, 'Сбросов по типам', parts.length ? parts.join('; ') : 'нет данных');
+
+  const h = document.createElement('h3');
+  h.textContent = 'Журнал перезагрузок (сверху - самая свежая)';
+  box.appendChild(h);
+  if (d.log.length === 0) {
+    diagRow(box, 'Журнал', 'пуст');
+    return;
+  }
+  d.log.forEach(function(r, i) {
+    // r: [причина, этап, источник, эпоха, аптайм, минПамять, максЦикл, воздух, флаги, аварии]
+    const ev = document.createElement('div');
+    ev.className = 'ev';
+    const head = document.createElement('strong');
+    head.textContent = (i + 1) + '. ' + reasonName(r[0]) + (i === 0 ? ' (этим сбросом начался текущий запуск)' : '');
+    ev.appendChild(head);
+    const body = document.createElement('div');
+    if (r[2] === 0) {
+      body.textContent = 'данных о предыдущем запуске нет';
+    } else {
+      const lines = [];
+      lines.push('предыдущий запуск проработал ' + fmtDur(r[4]));
+      lines.push(r[3] ? ('последняя активность: ' + fmtTime(r[3]) + (r[2] === 2 ? ' (+/- 10 мин)' : '')) : 'время последней активности неизвестно (не было NTP)');
+      lines.push('место в программе: ' + (STAGE_NAMES[r[1]] !== undefined ? STAGE_NAMES[r[1]] : r[1]));
+      lines.push('нагрев: SSR ' + ((r[8] & 1) ? 'включён' : 'выключен') + ', ЭМР ' + ((r[8] & 2) ? 'замкнут' : 'разомкнут'));
+      lines.push('воздух: ' + (r[7] === -1270 ? 'нет данных' : (r[7] / 10).toFixed(1) + ' °C'));
+      lines.push('минимум памяти: ' + kb(r[5]) + ' КБ, самая долгая итерация: ' + r[6] + ' мс');
+      if (r[9]) lines.push('аварии: ' + alarmText(r[9]));
+      body.textContent = lines.join('; ');
+    }
+    ev.appendChild(body);
+    box.appendChild(ev);
+  });
+}
+
+function updateDiag() {
+  fetch('/api/diag').then(function(r) {
+    if (!r.ok) throw new Error('diag HTTP ' + r.status);
+    return r.json();
+  }).then(renderDiag).catch(function() { /* повторим на следующем тике */ });
+}
+
+setInterval(updateDiag, 30000);
+updateDiag();
+</script>
+</body>
+</html>
+)HTMLPAGE";
+
+void handleDiagPage() {
+  server.send_P(200, "text/html", DIAG_HTML);
+}
 
 void handleGraphs() {
   server.send_P(200, "text/html", GRAPHS_HTML);
@@ -3175,6 +4085,8 @@ void setupWebServer() {
   server.on("/graphs", HTTP_GET, handleGraphs);
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/history", HTTP_GET, handleApiHistory);
+  server.on("/diag", HTTP_GET, handleDiagPage);
+  server.on("/api/diag", HTTP_GET, handleApiDiag);
   server.on("/api/setpoint", HTTP_POST, handleApiSetpoint);
   server.on("/api/ota/confirm", HTTP_POST, handleApiOtaConfirm);
   server.on("/api/ota/decline", HTTP_POST, handleApiOtaDecline);
@@ -3198,6 +4110,10 @@ void setup() {
                                                  // см. updateEmr()/systemReady
   emrClosed = false;
   systemStartMs = millis();
+
+  // диагностика: разобрать, чем закончился предыдущий запуск (сразу после
+  // безопасных уровней на реле, до всего остального)
+  diagBoot();
   lastEncoderActivityMs = millis(); // отсчёт автовыключения подсветки начинается с момента старта
 
   // --- экран и стартовая заставка с версией - сразу, до инициализации
@@ -3217,6 +4133,9 @@ void setup() {
 
   // --- Wi-Fi и веб-сервер запускаем в начале - подключение идёт в фоне
   // (неблокирующе), параллельно с остальной инициализацией ниже ---
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 2)
+  WiFi.onEvent(diagOnWifiEvent); // счётчики подключений/разрывов Wi-Fi
+#endif
   startWifiConnection();
   setupWebServer();
 
@@ -3266,6 +4185,8 @@ void setup() {
   // watchdog включаем в самом конце setup() - вся блокирующая инициализация
   // позади, дальше loop() обязан "отмечаться" не реже WDT_TIMEOUT_S секунд
   wdtStart();
+
+  diagBusyClear(); // запуск завершён - снимаем метку "завис при старте"
 }
 
 // ---------------------------------------------------------------------------
@@ -3293,6 +4214,8 @@ extern "C" bool verifyRollbackLater() {
 
 void loop() {
   wdtFeed();
+  diagTick();
+  diagStage(STAGE_BUTTONS);
 
   if (!otaImageMarkedValid && tempPollCompletedOnce &&
       (millis() - systemStartMs >= OTA_VALIDATE_AFTER_MS)) {
@@ -3310,11 +4233,14 @@ void loop() {
     // портал WiFiManager занят своими делами - наш собственный веб-сервер
     // в это время остановлен (см. startWifiSetupPortal()), поэтому
     // server.handleClient() здесь не вызываем
+    diagStage(STAGE_WIFI);
     updateWifiSetupPortal();
   } else {
+    diagStage(STAGE_WIFI);
     updateWifiConnection(); // неблокирующая проверка/переподключение Wi-Fi
     updateTimeSync();       // неблокирующая проверка/повтор синхронизации NTP
     updateOtaCheck();       // неблокирующий (по частоте) запуск проверки версии прошивки
+    diagStage(STAGE_WEB);
     server.handleClient();  // обработка входящих HTTP-запросов, если они есть
   }
 
@@ -3322,7 +4248,7 @@ void loop() {
   // здесь (а не прямо в HTTP-обработчике), чтобы сначала успеть отправить
   // ответ браузеру. Сама операция БЛОКИРУЕТ выполнение на время скачивания
   // и записи (см. подробности в performFirmwareUpdate()).
-  if (otaConfirmedTriggered) {
+  if (otaConfirmedTriggered && !otaCheckTaskRunning) { // флаг подождёт, пока закончится фоновая проверка версии
     otaConfirmedTriggered = false;
     performFirmwareUpdate();
   }
@@ -3344,8 +4270,10 @@ void loop() {
     lastTempPollMs = now;
     startTempPollCycle();
   }
+  diagStage(STAGE_SENSORS);
   updateTempPollStateMachine(); // продвигает неблокирующий опрос датчиков, если он идёт
 
+  diagStage(STAGE_CURRENT);
   checkCurrent();      // сама регулирует частоту вызова внутри себя (быстро, для аварий)
 
   if (now - lastHistorySampleMs >= HISTORY_SAMPLE_INTERVAL_MS) {
@@ -3358,6 +4286,7 @@ void loop() {
     currentAmpsForDisplay = currentAmpsHundredths; // снимок для показа раз в 5 секунд
   }
 
+  diagStage(STAGE_THERMOSTAT);
   updateThermostat();
   updateEmr();
 
@@ -3366,6 +4295,8 @@ void loop() {
   // подсветка включится обратно, обычная логика "перерисовать только при
   // изменении" сама корректно досчитает всё, что накопилось за это время
   if (backlightOn) {
+    diagStage(STAGE_DISPLAY);
     updateDisplay();
   }
+  diagStage(STAGE_LOOP);
 }
