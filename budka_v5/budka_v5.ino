@@ -227,7 +227,7 @@ const unsigned long DEBOUNCE_MS   = 30;
 // --- EEPROM ---
 const int EEPROM_SIZE = 24;
 const int EEPROM_ADDR_MAGIC = 0;         // 1 байт - признак "данные валидны"
-const int EEPROM_ADDR_SETPOINT = 1;      // 1 байт - уставка
+const int EEPROM_ADDR_SETPOINT = 1;      // 1 байт - установка
 const int EEPROM_ADDR_OTA_DECLINED_LEN = 3; // 1 байт - длина строки версии, отклонённой пользователем (0 = ничего не отклонено)
 const int EEPROM_ADDR_OTA_DECLINED_STR = 4; // до 15 байт - сама строка версии (например "1.2.3"), без null-терминатора
 const uint8_t EEPROM_MAGIC_VALUE = 0xA5;
@@ -376,7 +376,7 @@ bool tempMatErrorLastShown = false;
 bool tempAirErrorLastShown = false;
 bool tempOutErrorLastShown = false;
 
-// то же самое для полей уставки/статуса нагрева/аварий - чтобы не мигали,
+// то же самое для полей установки/статуса нагрева/аварий - чтобы не мигали,
 // если реального изменения значения не произошло
 int8_t  lastShownSetpointValue  = -128; // сентинел, вне диапазона 5..30
 bool    lastShownEditingMode    = false;
@@ -387,12 +387,12 @@ bool    lastShownEmergencyMode  = false; // для перерисовки инд
 
 uint16_t lastShownAlarmFlags    = 0xFFFF; // сентинел, вне диапазона реальных флагов (0..15)
 
-int8_t setpointC = SETPOINT_DEFAULT_C;   // текущая активная уставка
-int8_t pendingSetpointC = SETPOINT_DEFAULT_C; // уставка, которую крутят энкодером, но ещё не подтвердили
+int8_t setpointC = SETPOINT_DEFAULT_C;   // текущая активная установка
+int8_t pendingSetpointC = SETPOINT_DEFAULT_C; // установка, которую крутят энкодером, но ещё не подтвердили
 
-// если после начала редактирования уставки энкодером кнопка подтверждения
+// если после начала редактирования установки энкодером кнопка подтверждения
 // не нажата в течение этого времени - редактирование отменяется, и
-// значение возвращается к последней подтверждённой уставке
+// значение возвращается к последней подтверждённой установке
 const unsigned long ENCODER_EDIT_TIMEOUT_MS = 10000;
 unsigned long editingActivityMs = 0; // обновляется при входе в режим редактирования и на каждом клике
 bool editingSetpoint = false;
@@ -487,7 +487,7 @@ SystemMode systemMode = MODE_NORMAL;
 
 bool wifiSetupConfirmYes = false; // по умолчанию выделено "НЕТ" - защита от случайного входа
 unsigned long wifiSetupConfirmActivityMs = 0;
-const unsigned long WIFI_SETUP_CONFIRM_TIMEOUT_MS = 10000; // 10с на решение - отмена по таймауту, как и для уставки
+const unsigned long WIFI_SETUP_CONFIRM_TIMEOUT_MS = 10000; // 10с на решение - отмена по таймауту, как и для установки
 
 // --- автоматическое выключение подсветки при бездействии энкодера ---
 const unsigned long BACKLIGHT_AUTO_OFF_MS = 10UL * 60UL * 1000UL; // 10 минут
@@ -621,7 +621,7 @@ void onShortPress() {
   switch (systemMode) {
     case MODE_NORMAL:
       if (editingSetpoint) {
-        // подтверждение новой уставки
+        // подтверждение новой установки
         setpointC = pendingSetpointC;
         editingSetpoint = false;
         saveSetpointToEeprom(setpointC);
@@ -728,7 +728,7 @@ String loadOtaDeclinedVersion() {
 }
 
 void saveOtaDeclinedVersion(const String &version) {
-  // то же самое, что и для уставки: не пишем во флеш, если версия уже сохранена
+  // то же самое, что и для установки: не пишем во флеш, если версия уже сохранена
   if (loadOtaDeclinedVersion() == version) {
     return;
   }
@@ -1351,7 +1351,7 @@ void updateEmr() {
 }
 
 // ---------------------------------------------------------------------------
-// ОБРАБОТКА ЭНКОДЕРА (перевод импульсов в изменение уставки)
+// ОБРАБОТКА ЭНКОДЕРА (перевод импульсов в изменение установки)
 // ---------------------------------------------------------------------------
 void handleEncoder() {
   noInterrupts();
@@ -1406,9 +1406,9 @@ void handleEncoder() {
   pendingSetpointC = (int8_t)newVal;
 }
 
-// Если редактирование уставки энкодером не подтверждено коротким нажатием
+// Если редактирование установки энкодером не подтверждено коротким нажатием
 // в течение ENCODER_EDIT_TIMEOUT_MS - отменяем его, возвращая последнюю
-// подтверждённую уставку (визуально это просто выход из режима редактирования,
+// подтверждённую установку (визуально это просто выход из режима редактирования,
 // т.к. отображение при !editingSetpoint и так показывает setpointC).
 void checkEncoderEditTimeout() {
   if (editingSetpoint && (millis() - editingActivityMs >= ENCODER_EDIT_TIMEOUT_MS)) {
@@ -1711,7 +1711,7 @@ void updateDisplay() {
     tempMatErrorLastShown = tempMatError;
   }
 
-  // --- уставка / режим редактирования ---
+  // --- установка / режим редактирования ---
   // текущее отображаемое значение зависит от режима: в редактировании
   // показываем pendingSetpointC, иначе - активную setpointC
   int8_t currentValueToShow = editingSetpoint ? pendingSetpointC : setpointC;
@@ -2579,7 +2579,7 @@ void handleApiDiag() {
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.1.7";
+const char* FIRMWARE_VERSION = "1.1.8";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -3961,7 +3961,7 @@ function renderDiag(d) {
 
   sect(box, 'Состояние сейчас');
   diagRow(box, 'Температуры: улица / воздух / коврик', t10(d.st[0]) + ' / ' + t10(d.st[1]) + ' / ' + t10(d.st[2]) + ' °C');
-  diagRow(box, 'Уставка', d.st[3] + ' °C');
+  diagRow(box, 'Установка', d.st[3] + ' °C');
   diagRow(box, 'Нагрев', 'SSR ' + (d.st[5] ? 'включён' : 'выключен') + ', ЭМР ' + (d.st[6] ? 'замкнут' : 'разомкнут') + (d.st[8] ? ', аварийный таймерный режим' : ''));
   diagRow(box, 'Ток нагревателя', d.st[4] + ' мА');
   diagRow(box, 'Аварии', alarmText(d.st[7]));
