@@ -73,6 +73,17 @@
 #include <Preferences.h>  // NVS - журнал перезагрузок (блок ДИАГНОСТИКА)
 #include "esp_system.h"   // esp_reset_reason()
 #include "esp_timer.h"    // esp_timer_get_time() - время работы без переполнения millis()
+#include "esp_wifi.h"     // esp_wifi_get_ps() - режим энергосбережения Wi-Fi
+#include <lwip/sockets.h> // запасной вариант проверки связи (TCP-проба шлюза), если нет ping
+// Проверка связи пингом шлюза использует esp_ping (ping/ping_sock.h). Если в
+// установленном ядре ESP32 этого заголовка нет - код автоматически переключается
+// на запасной вариант (см. блок СЕТЕВОЙ СТОРОЖЕВОЙ ТАЙМЕР).
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && __has_include("ping/ping_sock.h")
+  #include "ping/ping_sock.h"
+  #define NETWD_HAVE_PING 1
+#else
+  #define NETWD_HAVE_PING 0
+#endif
 #include "esp_task_wdt.h"  // сторожевой таймер (watchdog) - см. блок WATCHDOG ниже
 #include "soc/soc.h"       // REG_READ - прямое чтение регистра GPIO в ISR энкодера
 #include "soc/gpio_reg.h"  // GPIO_IN_REG
@@ -2021,11 +2032,13 @@ enum DiagStage : uint8_t {
 enum DiagEventType : uint8_t {
   EV_BOOT = 1, EV_ALARM_SET = 2, EV_ALARM_CLR = 3, EV_WIFI_DOWN = 4, EV_WIFI_UP = 5,
   EV_NTP = 6, EV_OTA_CHECK = 7, EV_SENSOR_BAD = 8, EV_SENSOR_REINIT = 9, EV_STALL = 10,
-  EV_HEAP = 11, EV_EMERGENCY = 12, EV_EMR = 13, EV_ENC_NOISE = 14
+  EV_HEAP = 11, EV_EMERGENCY = 12, EV_EMR = 13, EV_ENC_NOISE = 14,
+  EV_NET_LOST = 15, EV_NET_RECOVER = 16, EV_NET_OK = 17
 };
-const char* const DIAG_EVENT_NAMES[15] = {
+const char* const DIAG_EVENT_NAMES[18] = {
   "?", "BOOT", "ALARM_SET", "ALARM_CLEAR", "WIFI_DOWN", "WIFI_UP", "NTP_SYNC", "OTA_CHECK",
-  "SENSOR_BAD", "SENSOR_REINIT", "LOOP_STALL", "HEAP_DROP", "EMERGENCY_MODE", "EMR", "ENC_NOISE"
+  "SENSOR_BAD", "SENSOR_REINIT", "LOOP_STALL", "HEAP_DROP", "EMERGENCY_MODE", "EMR", "ENC_NOISE",
+  "NET_LOST", "NET_RECOVER", "NET_OK"
 };
 struct DiagEvent {             // 20 байт
   uint32_t uptimeSec;
@@ -2039,8 +2052,8 @@ const uint8_t DIAG_EVENT_RING = 32;
 DiagEvent diagEvents[DIAG_EVENT_RING];
 uint8_t diagEventHead = 0;     // куда писать следующее событие
 uint8_t diagEventCount = 0;
-unsigned long diagEvLastMs[16];
-int32_t diagEvLastA[16];
+unsigned long diagEvLastMs[24];
+int32_t diagEvLastA[24];
 uint32_t diagEventSuppressed = 0; // сколько повторов подавлено (одинаковое событие чаще раза в 30 с)
 
 // счётчики датчиков температуры (0 - коврик, 1 - воздух, 2 - улица)
@@ -2096,6 +2109,24 @@ unsigned long diagLastNvsMs = 0;
 volatile uint32_t diagOtaCheckCount = 0;
 volatile uint32_t diagOtaCheckLastMs = 0;
 volatile uint8_t diagOtaCheckResult = 0;
+
+// --- сеть: проверка связи со шлюзом и восстановление (см. СЕТЕВОЙ СТОРОЖЕВОЙ ТАЙМЕР) ---
+volatile uint32_t netPingOk = 0;             // ответов шлюза с запуска
+volatile uint32_t netPingFail = 0;           // потерянных (без ответа) с запуска
+volatile uint32_t netPingConsecFail = 0;     // потерь подряд сейчас
+volatile uint32_t netPingLastRttMs = 0;      // время отклика последнего ответа, мс
+volatile unsigned long netPingLastOkMs = 0;  // millis() последнего ответа (0 - не было)
+bool netPingActive = false;                  // проверка связи сейчас запущена
+uint32_t netRecoveries[4];                   // сколько раз выполнялись ступени 1..3 (индекс 0 не используется)
+unsigned long netLastRecoveryMs = 0;
+uint8_t netLastRecoveryLevel = 0;
+uint32_t webRequestCount = 0;                // обслужено HTTP-запросов с запуска
+unsigned long webLastRequestMs = 0;
+// Вызывается в начале каждого обработчика веб-запроса: "пульс" веб-сервера.
+void webTouch() {
+  webRequestCount++;
+  webLastRequestMs = millis();
+}
 
 // Сколько МАКСИМУМ времени (мс) контроллер провёл в каждом этапе за один заход -
 // показывает, какой именно участок loop() блокирует выполнение дольше всего.
@@ -2200,7 +2231,7 @@ void diagFmtUtc(char* out, size_t n, uint32_t epoch) {
 // Вызывается ТОЛЬКО из потока loop().
 void diagEvent(uint8_t type, int32_t a, int32_t b) {
   unsigned long now = millis();
-  if (type < 16) {
+  if (type < 24) {
     if (diagEvLastMs[type] != 0 && diagEvLastA[type] == a && (now - diagEvLastMs[type]) < 30000UL) {
       diagEventSuppressed++;
       return;
@@ -2217,7 +2248,7 @@ void diagEvent(uint8_t type, int32_t a, int32_t b) {
   diagEventHead = (diagEventHead + 1) % DIAG_EVENT_RING;
   if (diagEventCount < DIAG_EVENT_RING) diagEventCount++;
   DLOG("[%lus] EVENT %s a=%ld b=%ld\n", (unsigned long)e.uptimeSec,
-       DIAG_EVENT_NAMES[type < 15 ? type : 0], (long)a, (long)b);
+       DIAG_EVENT_NAMES[type < 18 ? type : 0], (long)a, (long)b);
 }
 
 // Хуки из кода датчиков: плохое чтение и переинициализация.
@@ -2357,14 +2388,15 @@ void diagPrintBootReport() {
 // Строка состояния в UART (раз в DIAG_UART_STATUS_MS).
 void diagPrintStatus() {
 #if DIAG_UART_ENABLED
-  DLOG("[%lus] T out=%d air=%d mat=%d set=%dC SSR=%d EMR=%d I=%dmA alarm=0x%02X emerg=%d | heap=%u/%u/%u wifi=%s rssi=%d disc=%lu | lps=%lu maxloop=%lums stack_free=%lu | encinv=%lu/%lu\n",
+  DLOG("[%lus] T out=%d air=%d mat=%d set=%dC SSR=%d EMR=%d I=%dmA alarm=0x%02X emerg=%d | heap=%u/%u/%u wifi=%s rssi=%d disc=%lu | lps=%lu maxloop=%lums stack_free=%lu | encinv=%lu/%lu | ping=%lu/%lu c=%lu req=%lu\n",
        (unsigned long)diagUptimeSec(), (int)tempOut, (int)tempAir, (int)tempMat, (int)setpointC,
        ssrState ? 1 : 0, emrClosed ? 1 : 0, (int)currentAmpsHundredths * 10, (unsigned)alarmFlags,
        emergencyModeActive ? 1 : 0,
        (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
        wifiState == WIFI_ST_CONNECTED ? "up" : "down", wifiState == WIFI_ST_CONNECTED ? (int)WiFi.RSSI() : 0,
        (unsigned long)diagWifiDisconnects, (unsigned long)diagLoopsPerSec, (unsigned long)diagMaxLoopMs,
-       (unsigned long)diagStackMinFree, (unsigned long)encoderInvalidCount, (unsigned long)encoderIsrCount);
+       (unsigned long)diagStackMinFree, (unsigned long)encoderInvalidCount, (unsigned long)encoderIsrCount,
+       (unsigned long)netPingOk, (unsigned long)netPingFail, (unsigned long)netPingConsecFail, (unsigned long)webRequestCount);
 #endif
 }
 
@@ -2493,6 +2525,7 @@ String diagJsonSafe(const char* in) {
 
 // JSON для страницы диагностики (/diag): состояние, счётчики, журнал и лента событий.
 void handleApiDiag() {
+  webTouch();
   String js;
   js.reserve(4200);
   js += F("{\"up\":");   js += diagUptimeSec();
@@ -2536,7 +2569,20 @@ void handleApiDiag() {
   }
   js += F("],\"en\":["); js += encoderIsrCount; js += ','; js += encoderInvalidCount;
   js += F("],\"cs\":["); js += (int)currentNoiseBaselineRms; js += ','; js += (currentBaselineCalibrated ? 1 : 0);
-  js += F("],\"sy\":[");
+  js += F("],\"nw\":[");
+  js += (netPingActive ? 1 : 0); js += ','; js += (NETWD_HAVE_PING ? 1 : 2); js += ',';
+  js += netPingOk; js += ','; js += netPingFail; js += ','; js += netPingConsecFail; js += ',';
+  js += netPingLastRttMs; js += ',';
+  js += (netPingLastOkMs ? (int)((millis() - netPingLastOkMs) / 1000) : -1); js += ',';
+  js += netRecoveries[1]; js += ','; js += netRecoveries[2]; js += ','; js += netRecoveries[3]; js += ',';
+  js += (netLastRecoveryMs ? (int)((millis() - netLastRecoveryMs) / 1000) : -1); js += ',';
+  js += netLastRecoveryLevel; js += ',';
+  js += webRequestCount; js += ',';
+  js += (webLastRequestMs ? (int)((millis() - webLastRequestMs) / 1000) : -1); js += ',';
+  { wifi_ps_type_t ps; js += (esp_wifi_get_ps(&ps) == ESP_OK ? (int)ps : -1); }
+  js += F("],\"gw\":\"");
+  if (wifiState == WIFI_ST_CONNECTED) js += WiFi.gatewayIP().toString();
+  js += F("\",\"sy\":[");
   js += (uint32_t)ESP.getCpuFreqMHz(); js += ','; js += (uint32_t)ESP.getChipRevision(); js += ',';
   js += (uint32_t)(ESP.getFlashChipSize() / 1048576); js += ','; js += (uint32_t)(ESP.getSketchSize() / 1024); js += ',';
   js += (uint32_t)(ESP.getFreeSketchSpace() / 1024); js += ','; js += diagStackMinFree; js += ',';
@@ -2576,10 +2622,253 @@ void handleApiDiag() {
   server.send(200, "application/json", js);
 }
 
+// ---------------------------------------------------------------------------
+// СЕТЕВОЙ СТОРОЖЕВОЙ ТАЙМЕР (восстановление связи БЕЗ перезагрузки контроллера)
+// ---------------------------------------------------------------------------
+// Проблема, которую это решает: бывает, что контроллер работает (экран,
+// термостат, статистика), а по сети он недоступен - не пингуется и не открывает
+// страницы. WiFi.status() при этом может продолжать показывать "подключено"
+// (точка доступа молча перестала обслуживать устройство), поэтому обычная
+// логика переподключения (updateWifiConnection()) ничего не замечает.
+//
+// Как работает защита:
+//  1. Раз в 20 с контроллер сам пингует шлюз (роутер) - в фоне, не блокируя loop().
+//     Исходящий трафик заодно поддерживает "живыми" записи ARP на роутере.
+//  2. Если ответов нет 70 с подряд, а раньше шлюз отвечал (роутер, который
+//     никогда не отвечал на ping, сторож не включает - иначе он бы вечно
+//     "лечил" здоровую сеть), запускается лестница восстановления. Каждая
+//     следующая ступень - только если предыдущая не помогла (проверка снова через ~70 с):
+//        ступень 1 - перезапуск веб-сервера (server.stop()/begin());
+//        ступень 2 - переподключение к Wi-Fi (disconnect + begin);
+//        ступень 3 - полный перезапуск Wi-Fi (выключить радио и включить заново),
+//                    повторяется раз в 5 минут, пока связь не вернётся.
+//  3. Перезагрузки контроллера НЕТ ни на одной ступени: статистика графиков
+//     (хранится в оперативной памяти), термостат и защиты продолжают работать.
+//  4. Энергосбережение Wi-Fi (modem sleep) отключается при каждом подключении:
+//     по умолчанию ESP32 "засыпает" между маяками точки доступа, из-за чего часть
+//     роутеров периодически теряет с ним связь (пропадают ping и страницы).
+//     Питание здесь резервированное, лишние ~50 мА не имеют значения.
+const unsigned long NETWD_PING_INTERVAL_MS = 20000UL;
+const unsigned long NETWD_SILENCE_MS       = 70000UL;  // тишина, после которой начинаем лечить
+const unsigned long NETWD_LEVEL3_REPEAT_MS = 300000UL; // повтор последней ступени
+
+#if NETWD_HAVE_PING
+esp_ping_handle_t netPingHandle = NULL;
+
+// Обработчики вызываются из задачи ping (не из loop()) - только счётчики.
+void netwdOnPingSuccess(esp_ping_handle_t hdl, void* args) {
+  uint32_t elapsed = 0;
+  esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
+  netPingLastRttMs = elapsed;
+  netPingOk++;
+  netPingConsecFail = 0;
+  netPingLastOkMs = millis();
+}
+void netwdOnPingTimeout(esp_ping_handle_t hdl, void* args) {
+  netPingFail++;
+  netPingConsecFail++;
+}
+void netwdOnPingEnd(esp_ping_handle_t hdl, void* args) {}
+
+void netwdPingStop() {
+  if (netPingHandle != NULL) {
+    esp_ping_stop(netPingHandle);
+    esp_ping_delete_session(netPingHandle);
+    netPingHandle = NULL;
+  }
+  netPingActive = false;
+}
+
+void netwdPingStart() {
+  if (netPingHandle != NULL) return;
+  ip_addr_t target;
+  if (!ipaddr_aton(WiFi.gatewayIP().toString().c_str(), &target)) return;
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  cfg.target_addr = target;
+  cfg.count = ESP_PING_COUNT_INFINITE;
+  cfg.interval_ms = NETWD_PING_INTERVAL_MS;
+  cfg.timeout_ms = 3000;
+  cfg.data_size = 16;
+  cfg.task_stack_size = 3072;
+  esp_ping_callbacks_t cbs;
+  memset(&cbs, 0, sizeof(cbs));
+  cbs.on_ping_success = netwdOnPingSuccess;
+  cbs.on_ping_timeout = netwdOnPingTimeout;
+  cbs.on_ping_end = netwdOnPingEnd;
+  if (esp_ping_new_session(&cfg, &cbs, &netPingHandle) != ESP_OK) { netPingHandle = NULL; return; }
+  if (esp_ping_start(netPingHandle) != ESP_OK) { esp_ping_delete_session(netPingHandle); netPingHandle = NULL; return; }
+  netPingActive = true;
+}
+#else
+// Запасной вариант без ping: раз в 20 с неблокирующая TCP-проба шлюза (порт 80).
+// Достижимость подтверждает и успешное соединение, и отказ (RST) - т.е. любой
+// ответ роутера. Если роутер молча отбрасывает пакеты на закрытые порты, проба
+// ни разу не получит ответа, сторож не "вооружится" и ничего лечить не будет.
+int netProbeSock = -1;
+unsigned long netProbeStartMs = 0;
+unsigned long netProbeNextMs = 0;
+
+void netProbeFinish(bool ok) {
+  if (netProbeSock >= 0) { close(netProbeSock); netProbeSock = -1; }
+  if (ok) {
+    netPingLastRttMs = (uint32_t)(millis() - netProbeStartMs);
+    netPingOk++;
+    netPingConsecFail = 0;
+    netPingLastOkMs = millis();
+  } else {
+    netPingFail++;
+    netPingConsecFail++;
+  }
+}
+
+void netwdPingStop() {
+  if (netProbeSock >= 0) { close(netProbeSock); netProbeSock = -1; }
+  netPingActive = false;
+}
+void netwdPingStart() { netPingActive = true; netProbeNextMs = 0; }
+
+void netProbePoll() {
+  unsigned long now = millis();
+  if (netProbeSock < 0) {
+    if (netProbeNextMs != 0 && (long)(now - netProbeNextMs) < 0) return;
+    netProbeNextMs = now + NETWD_PING_INTERVAL_MS;
+    netProbeStartMs = now;
+    netProbeSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (netProbeSock < 0) return;
+    int fl = fcntl(netProbeSock, F_GETFL, 0);
+    fcntl(netProbeSock, F_SETFL, fl | O_NONBLOCK);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    addr.sin_addr.s_addr = (uint32_t)WiFi.gatewayIP();
+    int r = connect(netProbeSock, (struct sockaddr*)&addr, sizeof(addr));
+    if (r == 0) netProbeFinish(true);
+    else if (errno != EINPROGRESS) netProbeFinish(errno == ECONNREFUSED);
+    return;
+  }
+  fd_set wf;
+  FD_ZERO(&wf);
+  FD_SET(netProbeSock, &wf);
+  struct timeval tv = {0, 0};
+  int sel = select(netProbeSock + 1, NULL, &wf, NULL, &tv);
+  if (sel > 0) {
+    int err = 0;
+    socklen_t len = sizeof(err);
+    getsockopt(netProbeSock, SOL_SOCKET, SO_ERROR, &err, &len);
+    netProbeFinish(err == 0 || err == ECONNREFUSED);
+  } else if (now - netProbeStartMs > 3000) {
+    netProbeFinish(false);
+  }
+}
+#endif
+
+// Применяет настройки Wi-Fi, которые сбрасываются при каждом (пере)запуске радио.
+void netwdApplyWifiTuning() {
+  WiFi.setSleep(false); // без энергосбережения - см. пояснение выше
+}
+
+// Ступени восстановления (см. описание блока). Вызываются только отсюда.
+void netwdRecover(uint8_t level, unsigned long silenceMs) {
+  netRecoveries[level]++;
+  netLastRecoveryMs = millis();
+  netLastRecoveryLevel = level;
+  diagEvent(EV_NET_RECOVER, level, (int32_t)(silenceMs / 1000));
+
+  if (level == 1) {
+    // перезапуск только веб-сервера
+    server.stop();
+    server.begin();
+    webServerRunning = true;
+    netwdApplyWifiTuning();
+  } else if (level == 2) {
+    // переподключение: дальше работает обычная логика updateWifiConnection()
+    // (она сама поднимет веб-сервер, когда Wi-Fi вернётся)
+    netwdPingStop();
+    if (webServerRunning) { server.stop(); webServerRunning = false; }
+    WiFi.disconnect();
+    connectToWifi();
+    wifiState = WIFI_ST_CONNECTING;
+    wifiStateChangeMs = millis();
+  } else {
+    // полный перезапуск радио Wi-Fi
+    netwdPingStop();
+    if (webServerRunning) { server.stop(); webServerRunning = false; }
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(200); // редкая операция (раз в минуты в худшем случае); WDT - 10 с
+    startWifiConnection(); // WiFi.mode(STA) + имя хоста + WiFi.begin(), состояние - "подключаемся"
+  }
+}
+
+// Вызывается каждую итерацию loop() (вне режима настройки Wi-Fi). Сама решает,
+// пора ли что-то делать: основная работа - раз в секунду.
+void updateNetWatchdog() {
+  static unsigned long lastRunMs = 0;
+  static WifiConnState prevState = WIFI_ST_CONNECTING;
+  static uint8_t episodeActions = 0;     // сколько ступеней уже выполнено в текущей "аварии"
+  static unsigned long lastActionMs = 0;
+  static bool lostReported = false;
+  unsigned long now = millis();
+
+#if !NETWD_HAVE_PING
+  if (netPingActive) netProbePoll(); // запасная проба опрашивается чаще, чем раз в секунду
+#endif
+
+  if (now - lastRunMs < 1000UL) return;
+  lastRunMs = now;
+
+  if (wifiState != WIFI_ST_CONNECTED) {
+    if (netPingActive) netwdPingStop();
+    prevState = wifiState;
+    return; // подключением занимается updateWifiConnection()
+  }
+  if (prevState != WIFI_ST_CONNECTED) {   // только что (пере)подключились
+    prevState = WIFI_ST_CONNECTED;
+    netwdApplyWifiTuning();
+  }
+  if (!netPingActive) {
+    if (now - wifiStateChangeMs > 3000UL && (uint32_t)WiFi.gatewayIP() != 0) netwdPingStart();
+    return;
+  }
+
+  // сторож "вооружён" только если шлюз хотя бы раз ответил на ping с момента запуска
+  if (netPingOk == 0) return;
+
+  unsigned long lastOk = netPingLastOkMs;
+  unsigned long ref = (lastOk != 0 && (long)(lastOk - wifiStateChangeMs) > 0) ? lastOk : wifiStateChangeMs;
+  if ((long)(now - ref) < 0) return;
+  unsigned long silence = now - ref;
+
+  // связь вернулась: был ответ уже ПОСЛЕ последнего нашего действия
+  bool okSinceAction = (lastOk != 0) && (episodeActions == 0 || (long)(lastOk - lastActionMs) > 0);
+  if (okSinceAction && silence < NETWD_SILENCE_MS) {
+    if (lostReported) {
+      lostReported = false;
+      diagEvent(EV_NET_OK, (int32_t)((now - lastActionMs) / 1000), 0);
+    }
+    episodeActions = 0;
+    return;
+  }
+
+  if (silence >= NETWD_SILENCE_MS && !lostReported) {
+    lostReported = true;
+    diagEvent(EV_NET_LOST, (int32_t)netPingConsecFail, (int32_t)(silence / 1000));
+  }
+
+  unsigned long wait = (episodeActions >= 3) ? NETWD_LEVEL3_REPEAT_MS : NETWD_SILENCE_MS;
+  if (silence >= NETWD_SILENCE_MS && (episodeActions == 0 || (now - lastActionMs) >= wait)) {
+    uint8_t level = (episodeActions == 0) ? 1 : (episodeActions == 1) ? 2 : 3;
+    if (episodeActions < 3) episodeActions++;
+    lastActionMs = now;
+    netwdRecover(level, silence);
+  }
+}
+
 // Версия ЭТОЙ прошивки - обновляйте вручную перед каждой новой компиляцией
 // и публикацией в репозиторий (простой формат X.Y.Z, сравнение ниже это
 // подразумевает).
-const char* FIRMWARE_VERSION = "1.1.8";
+const char* FIRMWARE_VERSION = "1.1.9";
 
 // Стартовый экран с версией прошивки - переменные состояния объявлены
 // раньше по файлу (см. рядом с lastRenderedMode), т.к. используются в
@@ -3149,10 +3438,12 @@ updateStatus();
 )HTMLPAGE";
 
 void handleRoot() {
+  webTouch();
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleApiStatus() {
+  webTouch();
   const char* alarmTexts[6] = {
     "Перегрев коврика", "Превышен ток", "SSR залип",
     "Обрыв нагрузки", "Отказ датчика воздуха", "Отказ датчика коврика"
@@ -3197,6 +3488,7 @@ void handleApiStatus() {
 }
 
 void handleApiSetpoint() {
+  webTouch();
   if (server.hasArg("value")) {
     int val = server.arg("value").toInt();
     if (val >= SETPOINT_MIN_C && val <= SETPOINT_MAX_C) {
@@ -3215,6 +3507,7 @@ void handleApiSetpoint() {
 // из loop() на следующей итерации, чтобы сначала успеть корректно отправить
 // ответ браузеру, а уже потом начинать долгую блокирующую операцию.
 void handleApiOtaConfirm() {
+  webTouch();
   if (!otaUpdateAvailable || otaUpdateInProgress) {
     server.send(409, "text/plain", "No update available or already in progress");
     return;
@@ -3224,6 +3517,7 @@ void handleApiOtaConfirm() {
 }
 
 void handleApiOtaDecline() {
+  webTouch();
   if (otaUpdateAvailable) {
     saveOtaDeclinedVersion(otaAvailableVersion);
     otaUpdateAvailable = false;
@@ -3298,6 +3592,7 @@ struct HistoryRingView {
 // слишком давно не обновлялся и часть точек уже вытеснена) - вся история
 // (флаг full = 1). Нумерация since у суточного и недельного буферов своя.
 void handleApiHistory() {
+  webTouch();
   uint32_t since = 0;
   uint32_t clientBoot = 0;
   if (server.hasArg("since")) since = strtoul(server.arg("since").c_str(), NULL, 10);
@@ -3375,7 +3670,7 @@ const char GRAPHS_HTML[] PROGMEM = R"HTMLPAGE(
   .legend span { margin-right:14px; }
   .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; }
   canvas { width:100%; height:auto; display:block; background:#181818; border-radius:8px; }
-  #tempChart { cursor:crosshair; touch-action:none; }
+  #tempChart, #curChart { cursor:crosshair; touch-action:none; }
   .info { font-size:12px; color:#777; text-align:center; margin-top:8px; }
   button { width:100%; padding:16px; font-size:19px; background:#444; color:#fff; border:none; border-radius:10px; margin-top:4px; }
   button:active { background:#333; }
@@ -3662,7 +3957,7 @@ function conv10(arr) {
 // перерисовать график (с курсором) БЕЗ повторного похода на сервер
 let lastHistory = null;
 let tempHoverX = null; // X-координата курсора/пальца в системе координат canvas (не CSS-пикселей)
-// у графика тока наведение/курсор не используются - он остаётся как раньше
+let curHoverX = null;  // то же для графика тока (подсказка работает на обоих графиках)
 
 function redrawCharts() {
   if (!lastHistory) return;
@@ -3676,7 +3971,7 @@ function redrawCharts() {
 
   drawChart(document.getElementById('curChart'), [
     { data: d.currentMa, color: '#ffa64d', label: 'Ток', unit: ' мА', decimals: 0 }
-  ], d.maxCount, true, d.timeSynced, d.nowEpoch, null, false, d.intervalSec / 60);
+  ], d.maxCount, true, d.timeSynced, d.nowEpoch, curHoverX, true, d.intervalSec / 60);
 }
 
 // --- накопленная на клиенте история ---
@@ -3838,9 +4133,7 @@ function attachHoverHandlers(canvas, setHoverX) {
 }
 
 attachHoverHandlers(document.getElementById('tempChart'), function(x) { tempHoverX = x; });
-// на графике тока наведение/курсор не нужны - обработчики не вешаем, canvas
-// остаётся с CSS-курсором по умолчанию (свойство cursor:crosshair снято ниже
-// точечно не требуется - карточка тока просто не реагирует на события)
+attachHoverHandlers(document.getElementById('curChart'), function(x) { curHoverX = x; });
 
 // новая точка истории появляется раз в минуту (HISTORY_SAMPLE_INTERVAL_MS) -
 // чаще опрашивать нет смысла
@@ -3944,6 +4237,9 @@ function eventText(e) {
     case 11: return 'Память: новый минимум ' + kb(a) + ' КБ (свободно ' + kb(b) + ' КБ)';
     case 12: return 'Аварийный таймерный режим ' + (a ? 'включён' : 'выключен');
     case 13: return 'ЭМР ' + (a ? 'замкнут' : 'разомкнут');
+    case 15: return 'Сеть: шлюз не отвечает ' + b + ' с (потерь подряд ' + a + ')';
+    case 16: return 'Восстановление сети, ступень ' + a + ': ' + ['', 'перезапуск веб-сервера', 'переподключение Wi-Fi', 'полный перезапуск Wi-Fi'][a] + ' (тишина ' + b + ' с)';
+    case 17: return 'Связь со шлюзом восстановилась (после ' + fmtDur(a) + ')';
     case 14: return 'Энкодер: ' + a + ' невозможных переходов за 10 с (помехи?), всего ' + b;
     default: return 'Событие ' + e[2] + ' (' + a + ', ' + b + ')';
   }
@@ -3985,6 +4281,16 @@ function renderDiag(d) {
   diagRow(box, 'Wi-Fi', d.rssi ? (d.rssi + ' дБм, канал ' + d.sy[10] + ', ' + d.ip + ', подключён ' + fmtDur(d.sy[11])) : 'нет связи');
   diagRow(box, 'Подключений / разрывов', d.wc + ' / ' + d.wd);
   if (d.wd > 0) diagRow(box, 'Причина последнего разрыва', WIFI_REASONS[d.wr] ? (WIFI_REASONS[d.wr] + ' (' + d.wr + ')') : ('код ' + d.wr));
+
+  sect(box, 'Сеть и веб-сервер');
+  const nw = d.nw; // [работает, метод(1 ping/2 TCP), ответов, потерь, потерь подряд, отклик мс, ответ назад с, ст.1, ст.2, ст.3, посл.восст. назад с, посл.ступень, запросов, посл.запрос назад с, режим сна Wi-Fi]
+  diagRow(box, 'Проверка связи со шлюзом', (nw[0] ? 'работает' : 'не запущена') + ' (' + (nw[1] === 1 ? 'ping' : 'TCP-проба') + (d.gw ? ', шлюз ' + d.gw : '') + ')');
+  diagRow(box, 'Ответов / потерь / подряд', nw[2] + ' / ' + nw[3] + ' / ' + nw[4]);
+  diagRow(box, 'Отклик шлюза', nw[2] ? (nw[5] + ' мс, последний ответ ' + (nw[6] >= 0 ? nw[6] + ' с назад' : '—')) : 'ответов ещё не было (сторож не активен)');
+  diagRow(box, 'Восстановлений сети (веб-сервер / Wi-Fi / перезапуск радио)', nw[7] + ' / ' + nw[8] + ' / ' + nw[9]);
+  if (nw[10] >= 0) diagRow(box, 'Последнее восстановление', 'ступень ' + nw[11] + ', ' + fmtDur(nw[10]) + ' назад');
+  diagRow(box, 'Веб-запросов обслужено', nw[12] + (nw[13] >= 0 ? ', последний ' + fmtDur(nw[13]) + ' назад' : ''));
+  diagRow(box, 'Энергосбережение Wi-Fi', nw[14] === 0 ? 'отключено' : nw[14] > 0 ? 'ВКЛЮЧЕНО (режим ' + nw[14] + ')' : 'нет данных');
 
   sect(box, 'Датчики температуры');
   d.sn.forEach(function(r, i) {
@@ -4073,10 +4379,12 @@ updateDiag();
 )HTMLPAGE";
 
 void handleDiagPage() {
+  webTouch();
   server.send_P(200, "text/html", DIAG_HTML);
 }
 
 void handleGraphs() {
+  webTouch();
   server.send_P(200, "text/html", GRAPHS_HTML);
 }
 
@@ -4240,6 +4548,7 @@ void loop() {
     updateWifiConnection(); // неблокирующая проверка/переподключение Wi-Fi
     updateTimeSync();       // неблокирующая проверка/повтор синхронизации NTP
     updateOtaCheck();       // неблокирующий (по частоте) запуск проверки версии прошивки
+    updateNetWatchdog();    // проверка связи со шлюзом и ступенчатое восстановление сети (без перезагрузки)
     diagStage(STAGE_WEB);
     server.handleClient();  // обработка входящих HTTP-запросов, если они есть
   }
